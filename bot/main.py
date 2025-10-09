@@ -231,8 +231,8 @@ def build_app() -> Application:
 def main():
     logger.info("🤖 mybot9 started successfully!")
     app = build_app()
-    # run_polling сам делает initialize/start/stop
-    app.run_polling(allowed_updates=constants.Update.ALL_TYPES)
+    # без allowed_updates — совместимо с твоей версией PTB
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
