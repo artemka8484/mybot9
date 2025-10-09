@@ -7,3 +7,4 @@ redis==5.0.7
 asyncpg==0.29.0
 loguru==0.7.3
 python-dateutil==2.9.0.post0
+loguru
