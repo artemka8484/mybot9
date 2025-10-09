@@ -1,442 +1,421 @@
 # bot/main.py
-import os
-import asyncio
-import fcntl
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, Any, List, Tuple
+# -*- coding: utf-8 -*-
+"""
+Телеграм-бот демо-трейдинга с реалистичным учётом плеча и комиссий.
+— без шума: сообщения только при ОТКРЫТИИ/ЗАКРЫТИИ позиции + /status
+— qty = equity * RISK_PCT * LEVERAGE / price  (исправлено)
+— PnL учитывает комиссию на вход и выход
+— winrate и pnl по каждому активу и по счёту
+"""
 
-import httpx
+import os
+import json
+import time
+import math
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import requests
 import numpy as np
 import pandas as pd
-from loguru import logger
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import Conflict
 
-# ================== ENV ==================
-TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+from telegram import ParseMode
+from telegram.utils.request import Request
+from telegram.ext import Updater, CommandHandler, CallbackContext
+
+# -------------------- ENV --------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-
-# режимы приема апдейтов
-USE_WEBHOOK = os.getenv("USE_WEBHOOK", "false").lower() in ("1", "true", "yes")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()        # напр. https://mybot9.koyeb.app/tg
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/tg").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mybot9-secret")
-
-# торговые параметры
 PAIRS = [p.strip().upper() for p in os.getenv(
     "PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 ).split(",") if p.strip()]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")
-LIMIT = int(os.getenv("KL_LIMIT", "300"))
+INTERVAL = os.getenv("TF", "1m")
+TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))  # частота тика на пару
+HISTORY = int(os.getenv("HISTORY", "200"))          # кол-во свечей
 
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
-START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
-LEVERAGE = min(5.0, float(os.getenv("LEVERAGE", "5")))  # максимум 5х
-FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in {"1", "true", "yes"}
+LEVERAGE = float(os.getenv("LEVERAGE", "5"))
+RISK_PCT = float(os.getenv("RISK_PCT", "0.03"))     # риск на сделку от equity
+FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))     # 0.06% на каждую сторону
+EQUITY_START = float(os.getenv("EQUITY_START", "1000"))
 
-ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.5"))
-ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1.0"))
+# -------------------- STATE --------------------
+equity = EQUITY_START
+start_equity = EQUITY_START
 
-EMA_LEN = int(os.getenv("EMA_LEN", "48"))
-EMA_SLOPE_BARS = int(os.getenv("EMA_SLOPE_BARS", "5"))
-
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "120"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "40"))
-
-DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0").lower() in ("1", "true", "yes")
-
-PORT = int(os.getenv("PORT", "8080"))
-
-# ================== STATE ==================
-state: Dict[str, Any] = {
-    "equity": START_BALANCE,
-    "last_equity": START_BALANCE,   # для расчёта Δ за сделку
-    "high_water": START_BALANCE,
-    "pairs": {
-        p: {
-            "pos": None,
-            "last_entry_ts": 0.0,
-            "day": None,
-            "trades_today": 0,
-            "stats": {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0},
-        } for p in PAIRS
-    }
+positions = {p: None for p in PAIRS}
+stats = {
+    p: {"trades": 0, "wins": 0, "pnl": 0.0}
+    for p in PAIRS
 }
+stats_total = {"trades": 0, "wins": 0, "pnl": 0.0}
 
-# ================== UTILS ==================
-def ensure_single_instance(lock_path: str = "/tmp/mybot9.lock"):
-    """Запрещаем второй экземпляр в том же контейнере."""
-    fd = open(lock_path, "w")
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fd.write(str(os.getpid()))
-        fd.flush()
-        return fd
-    except BlockingIOError:
-        logger.error("Another bot instance is already running. Exiting.")
-        raise SystemExit(0)
+# чтобы не дублировать открытие позиции в один и тот же тик
+last_signal_ts = {p: 0 for p in PAIRS}
 
-def utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def fmt(x: float, digits=5) -> str:
-    return f"{x:.{digits}f}"
-
-async def tg_send(app: Application, text: str):
-    if not TOKEN or not CHAT_ID:
-        logger.warning("No TELEGRAM creds")
-        return
-    try:
-        await app.bot.send_message(
-            chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
-    except Exception as e:
-        logger.error(f"TG send error: {e}")
-
+# -------------------- HEALTH --------------------
 def start_health_http_server():
-    """Health-сервер только в режиме polling.
-    Если порт занят — пробуем 8081/пропускаем, без падения."""
-    ports_to_try = [PORT, 8081]
     class Quiet(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args) -> None:
-            pass
-        def do_GET(self):
-            self.send_response(200 if self.path == "/" else 404)
-            self.end_headers()
-            if self.path == "/":
-                self.wfile.write(b"OK")
-    for p in ports_to_try:
-        try:
-            httpd = HTTPServer(("0.0.0.0", p), Quiet)
-            loop = asyncio.get_running_loop()
-            loop.create_task(asyncio.to_thread(httpd.serve_forever))
-            logger.info(f"Health server on :{p}")
+        def log_message(self, fmt, *args):  # тихий лог
             return
-        except OSError as e:
-            logger.warning(f"Health server bind failed on :{p} ({e}); try next/skip")
 
-# ================== DATA (MEXC) ==================
-MEXC_BASE = "https://api.mexc.com"
-TF_MAP = {"1m": "1m", "5m": "5m", "15m": "15m"}
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
 
-async def fetch_klines(pair: str) -> pd.DataFrame:
-    """Парсер klines, устойчивый к 8/12 полям: берем первые 6 (t, o, h, l, c, v)."""
-    tf = TF_MAP.get(TIMEFRAME, "1m")
-    url = f"{MEXC_BASE}/api/v3/klines"
-    params = {"symbol": pair, "interval": tf, "limit": LIMIT}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        raw = r.json()
+    # иногда порт уже занят — просто пропустим
+    try:
+        port = int(os.getenv("PORT", "8080"))
+        httpd = HTTPServer(("0.0.0.0", port), Quiet)
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+    except Exception as e:
+        print(f"[WARN] Health server bind failed: {e}")
 
-    rows: List[List[Any]] = []
-    for k in raw:
-        if isinstance(k, list) and len(k) >= 6:
-            rows.append([k[0], k[1], k[2], k[3], k[4], k[5]])
+
+# -------------------- MARKET DATA --------------------
+def _mexc_klines_url(symbol, interval, limit):
+    # MEXC spot kline endpoint
+    return f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+
+def fetch_klines(pair: str) -> pd.DataFrame:
+    """
+    Возвращает DataFrame с колонками: t, open, high, low, close, vol
+    Делает код устойчивым к 8/12-элементным массивам свечи.
+    """
+    url = _mexc_klines_url(pair, INTERVAL, HISTORY)
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        raise ValueError(f"Bad klines response: {data}")
+
+    rows = []
+    for row in data:
+        # ожидаем минимум: [openTime, open, high, low, close, volume, ...]
+        # MEXC часто отдаёт 12 полей, иногда агрегаторы — 8. Берём только первые 6.
+        if len(row) < 6:
+            continue
+        t = int(row[0])
+        o = float(row[1])
+        h = float(row[2])
+        l = float(row[3])
+        c = float(row[4])
+        v = float(row[5])
+        rows.append([t, o, h, l, c, v])
+
+    if not rows:
+        raise ValueError("Empty klines")
 
     df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "vol"])
-    for c in ["open", "high", "low", "close", "vol"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df.dropna(inplace=True)
     return df
 
+
+# -------------------- INDICATORS & STRATEGY --------------------
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
-def atr(df: pd.DataFrame, n: int) -> pd.Series:
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
 
-def patterns(df: pd.DataFrame) -> Dict[str, bool]:
-    o, h, l, c = df["open"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1], df["close"].iloc[-1]
-    o1, c1 = df["open"].iloc[-2], df["close"].iloc[-2]
-
-    bull_engulf = (c > o) and (c1 < o1) and (c >= o1) and (o <= c1)
-    bear_engulf = (c < o) and (c1 > o1) and (c <= o1) and (o >= c1)
-
+def detect_patterns(df: pd.DataFrame):
+    """
+    4 простых свечных сигнала: булл/бер энга́льфинг, молот, падающая звезда
+    """
+    o = df["open"].iloc[-2]
+    c = df["close"].iloc[-2]
+    h = df["high"].iloc[-2]
+    l = df["low"].iloc[-2]
     body = abs(c - o)
-    rng = max(h - l, 1e-9)
-    lower_tail = (min(c, o) - l) / rng
-    upper_tail = (h - max(c, o)) / rng
-    hammer = (lower_tail >= 0.55) and (body / rng <= 0.2)
-    shooting = (upper_tail >= 0.55) and (body / rng <= 0.2)
+    range_ = h - l + 1e-9
 
-    win = df["close"].iloc[-20:]
-    breakout_up = c >= win.max()
-    breakout_dn = c <= win.min()
+    bull_engulf = (c > o) and (c - o > body * 1.2) and (o < df["close"].iloc[-3] < c)
+    bear_engulf = (o > c) and (o - c > body * 1.2) and (c < df["close"].iloc[-3] < o)
+
+    # молот/падающая звезда по простым правилам
+    lower_tail = (min(o, c) - l)
+    upper_tail = (h - max(o, c))
+    hammer = (lower_tail > body * 2) and (upper_tail < body * 0.5)
+    shooting = (upper_tail > body * 2) and (lower_tail < body * 0.5)
 
     return {
         "bull_engulf": bool(bull_engulf),
         "bear_engulf": bool(bear_engulf),
         "hammer": bool(hammer),
         "shooting": bool(shooting),
-        "breakout_up": bool(breakout_up),
-        "breakout_dn": bool(breakout_dn),
     }
 
-def ema_slope(df: pd.DataFrame, length=EMA_LEN, bars=EMA_SLOPE_BARS) -> float:
-    e = ema(df["close"], length)
-    return float(e.iloc[-1] - e.iloc[-bars])
+def strategy_signal(df: pd.DataFrame):
+    """
+    Возвращает ('LONG'|'SHORT'|None, reason, tp, sl) по последней закрытой свече.
+    Логика: наклон EMA48 + свечные паттерны + простой breakout.
+    TP/SL считаем через ATR.
+    """
+    if len(df) < 60:
+        return None, None, None, None
 
-# ================== TRADING MODEL ==================
-def position_size_from_risk(entry: float, sl: float, equity: float) -> float:
-    risk_usd = equity * RISK_PCT
-    sl_dist = abs(entry - sl)
-    if sl_dist <= 0:
-        return 0.0
-    qty = risk_usd / (sl_dist * LEVERAGE)
-    return max(0.0, qty)
+    ema48 = ema(df["close"], 48)
+    slope = float(ema48.diff().tail(5).mean())  # средний наклон по 5 баров
+    atr14 = float(atr(df, 14).iloc[-2])
 
-def fees_cost(notional: float) -> float:
-    return notional * FEE_PCT
+    patt = detect_patterns(df)
+    last_close = float(df["close"].iloc[-2])
+    prev_high = float(df["high"].iloc[-2])
+    prev_low = float(df["low"].iloc[-2])
 
-def simulate_close(side: str, entry: float, exit_: float, qty: float) -> float:
-    direction = -1 if side == "SHORT" else 1
-    gross = (exit_ - entry) * qty * LEVERAGE * direction
-    fee = fees_cost(entry * qty) + fees_cost(exit_ * qty)
-    return gross - fee
+    # сигналы
+    long_trig = (slope > 0 and (patt["bull_engulf"] or patt["hammer"])) \
+                or (last_close > prev_high and slope >= 0)  # небольшой breakout
 
-def decide(df: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
-    patt = patterns(df)
-    slope = ema_slope(df, EMA_LEN, EMA_SLOPE_BARS)
-    atr_val = float(atr(df, ATR_LEN).iloc[-1])
-    last = float(df["close"].iloc[-1])
+    short_trig = (slope < 0 and (patt["bear_engulf"] or patt["shooting"])) \
+                 or (last_close < prev_low and slope <= 0)  # breakout вниз
 
-    long_sig = ((patt["bull_engulf"] or patt["hammer"] or patt["breakout_up"]) and slope > 0)
-    short_sig = ((patt["bear_engulf"] or patt["shooting"] or patt["breakout_dn"]) and slope < 0)
+    # TP/SL через ATR (чуть шире, чтобы сделки были реалистичнее)
+    tp_mul = 1.5
+    sl_mul = 1.2
 
-    return ("LONG" if long_sig else "SHORT" if short_sig else "FLAT"), {
-        "patt": patt, "slope": slope, "atr": atr_val, "last": last
-    }
+    if long_trig:
+        tp = last_close + tp_mul * atr14
+        sl = last_close - sl_mul * atr14
+        return "LONG", _reason("long", patt, slope, atr14), tp, sl
 
-# ================== PAIR LOOP ==================
-async def pair_loop(app: Application, pair: str):
-    logger.info(f"Loop started for {pair}")
+    if short_trig:
+        tp = last_close - tp_mul * atr14
+        sl = last_close + sl_mul * atr14
+        return "SHORT", _reason("short", patt, slope, atr14), tp, sl
+
+    return None, None, None, None
+
+def _reason(side, patt, slope, atr14):
+    used = []
+    for k, v in patt.items():
+        if v:
+            used.append(k)
+    if abs(slope) > 0:
+        used.append(f"slope {round(slope, 5)}")
+    used.append(f"ATR {round(atr14, 5)}")
+    return ", ".join(used) if used else side
+
+
+# -------------------- RISK, PNL --------------------
+def calc_qty(price: float) -> float:
+    """
+    Исправленная формула:
+    qty = (equity * RISK_PCT) * LEVERAGE / price
+    """
+    position_value = max(0.0, equity) * RISK_PCT * LEVERAGE
+    qty = position_value / max(1e-9, price)
+    return qty
+
+def calc_fees(entry_price: float, exit_price: float, qty: float) -> float:
+    """
+    Комиссия на вход и на выход: (entry*qty + exit*qty) * FEE_PCT
+    """
+    return (entry_price * qty + exit_price * qty) * FEE_PCT
+
+def close_position(pair: str, exit_price: float, now_ts: int):
+    global equity, stats_total
+
+    pos = positions[pair]
+    if not pos:
+        return
+
+    side = pos["side"]
+    entry = pos["entry"]
+    qty = pos["qty"]
+
+    if side == "LONG":
+        gross = (exit_price - entry) * qty
+    else:
+        gross = (entry - exit_price) * qty
+
+    fees = calc_fees(entry, exit_price, qty)
+    pnl = gross - fees
+
+    # обновляем equity и статистику
+    old_equity = equity
+    equity = round(equity + pnl, 8)
+
+    stats[pair]["trades"] += 1
+    stats[pair]["pnl"] = round(stats[pair]["pnl"] + pnl, 8)
+    stats[pair]["wins"] += 1 if pnl >= 0 else 0
+
+    stats_total["trades"] += 1
+    stats_total["pnl"] = round(stats_total["pnl"] + pnl, 8)
+    stats_total["wins"] += 1 if pnl >= 0 else 0
+
+    # сообщение
+    wr_pair = (stats[pair]["wins"] / stats[pair]["trades"] * 100.0) if stats[pair]["trades"] else 0.0
+    wr_total = (stats_total["wins"] / stats_total["trades"] * 100.0) if stats_total["trades"] else 0.0
+
+    status_emoji = "✅" if pnl >= 0 else "❌"
+    sign = "+" if pnl >= 0 else "−"
+
+    msg = (
+        f"{status_emoji} CLOSE {pair} ({'TP' if pos.get('reason')=='TP' else 'SL' if pos.get('reason')=='SL' else 'EXIT'})\n"
+        f"• time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now_ts/1000))} UTC\n"
+        f"• exit: {exit_price:.5f}\n"
+        f"• PnL: {sign}{abs(pnl):.5f}\n"
+        f"• pair stats: trades {stats[pair]['trades']}, WR {wr_pair:.2f}%, PnL {stats[pair]['pnl']:.5f}\n"
+        f"• total: trades {stats_total['trades']}, WR {wr_total:.2f}%, PnL {stats_total['pnl']:.5f}\n"
+        f"• balance: {equity:.5f}  (Δ {sign}{abs(pnl):.5f} | {((equity-start_equity)/max(1e-9,start_equity))*100:.2f}%)\n"
+        f"• since start: {((equity-start_equity)/max(1e-9,start_equity))*100:.2f}%   (lev {LEVERAGE:.1f}x, fee {FEE_PCT*100:.3f}%)"
+    )
+    tg_send(msg)
+
+    positions[pair] = None
+
+
+# -------------------- LOOP --------------------
+def pair_loop(pair: str):
+    global equity
+
     while True:
         try:
-            df = await fetch_klines(pair)
-            if len(df) < max(EMA_LEN, ATR_LEN, EMA_SLOPE_BARS) + 2:
-                await asyncio.sleep(5 if TIMEFRAME == '1m' else 15)
-                continue
+            df = fetch_klines(pair)
+            now_ts = int(df["t"].iloc[-1])  # открытая текущая свеча
+            last_closed_idx = -2            # последняя закрытая свеча
+            last_close = float(df["close"].iloc[last_closed_idx])
 
-            sig, info = decide(df)
-            pr = state["pairs"][pair]
+            # если есть позиция — проверяем TP/SL
+            pos = positions[pair]
+            if pos:
+                side = pos["side"]
+                tp = pos["tp"]
+                sl = pos["sl"]
 
-            # daily counters
-            now = datetime.now(timezone.utc)
-            if pr["day"] != now.date():
-                pr["day"] = now.date()
-                pr["trades_today"] = 0
+                exit_reason = None
+                if side == "LONG":
+                    if last_close >= tp:
+                        exit_reason = "TP"
+                    elif last_close <= sl:
+                        exit_reason = "SL"
+                else:  # SHORT
+                    if last_close <= tp:
+                        exit_reason = "TP"
+                    elif last_close >= sl:
+                        exit_reason = "SL"
 
-            last = info["last"]
-            atr_val = max(1e-9, info["atr"])
+                if exit_reason:
+                    positions[pair]["reason"] = exit_reason
+                    close_position(pair, last_close, now_ts)
 
-            # ---- manage open position
-            if pr["pos"]:
-                pos = pr["pos"]
-                side = pos["side"]; entry = pos["entry"]
-                tp = pos["tp"]; sl = pos["sl"]; qty = pos["qty"]
+            # если позиции нет — ищем сигнал
+            if not positions[pair]:
+                side, reason, tp, sl = strategy_signal(df)
+                if side and (now_ts != last_signal_ts[pair]):  # простая защита от повтора
+                    qty = calc_qty(last_close)
+                    if qty <= 0:
+                        time.sleep(TICK_SECONDS)
+                        continue
 
-                hit_tp = (last >= tp) if side == "LONG" else (last <= tp)
-                hit_sl = (last <= sl) if side == "LONG" else (last >= sl)
+                    positions[pair] = {
+                        "side": side,
+                        "entry": last_close,
+                        "qty": qty,
+                        "tp": tp,
+                        "sl": sl,
+                        "open_ts": now_ts,
+                    }
+                    last_signal_ts[pair] = now_ts
 
-                if hit_tp or hit_sl:
-                    # баланс до закрытия
-                    prev_equity = state["equity"]
-
-                    pnl = simulate_close(side, entry, last, qty)
-                    pr["pos"] = None
-
-                    # stats
-                    st = pr["stats"]
-                    st["trades"] += 1
-                    st["pnl"] += pnl
-                    if pnl >= 0:
-                        st["wins"] += 1
-                    else:
-                        st["losses"] += 1
-
-                    # обновляем общий баланс
-                    state["equity"] += pnl
-                    state["high_water"] = max(state["high_water"], state["equity"])
-
-                    # Δ за сделку и % к предыдущему балансу
-                    delta = state["equity"] - prev_equity
-                    delta_pct = (delta / prev_equity * 100.0) if prev_equity > 0 else 0.0
-                    # % к стартовому балансу
-                    total_pct = (state["equity"] / START_BALANCE - 1.0) * 100.0
-
-                    # winrates
-                    wr_pair = 100.0 * st["wins"] / st["trades"] if st["trades"] else 0.0
-                    tot_trades = sum(state["pairs"][p]["stats"]["trades"] for p in PAIRS)
-                    tot_wins = sum(state["pairs"][p]["stats"]["wins"] for p in PAIRS)
-                    tot_pnl = sum(state["pairs"][p]["stats"]["pnl"] for p in PAIRS)
-                    wr_tot = 100.0 * tot_wins / tot_trades if tot_trades else 0.0
-
-                    badge = "✅" if pnl >= 0 else "❌"
-                    txt = (
-                        f"{badge} <b>CLOSE {pair}</b> ({'TP' if hit_tp else 'SL'})"
-                        f"\n• time: {utcnow()}"
-                        f"\n• exit: {fmt(last,5)}"
-                        f"\n• PnL: {'+' if pnl>=0 else ''}{fmt(pnl,5)}"
-                        f"\n• pair stats: trades {st['trades']}, WR {fmt(wr_pair,2)}%, PnL {fmt(st['pnl'],5)}"
-                        f"\n• total: trades {tot_trades}, WR {fmt(wr_tot,2)}%, PnL {fmt(tot_pnl,5)}"
-                        f"\n• balance: {fmt(state['equity'],5)}  (Δ {'+' if delta>=0 else ''}{fmt(delta,5)} | {fmt(delta_pct,2)}%)"
-                        f"\n• since start: {fmt(total_pct,2)}%   (lev {LEVERAGE}×, fee {FEE_PCT*100:.3f}%)"
+                    msg = (
+                        f"🔴 OPEN {pair} {side}\n"
+                        f"• time: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now_ts/1000))} UTC\n"
+                        f"• entry: {last_close:.5f}\n"
+                        f"• qty: {qty:.6f}\n"
+                        f"• TP: {tp:.5f}    SL: {sl:.5f}\n"
+                        f"• signal: {reason if reason else 'strategy#9'}\n"
+                        f"• mode: {'DEMO' if DEMO_MODE else 'LIVE'}"
                     )
-                    await tg_send(app, txt)
-
-                    # запоминаем последний equity после сделки
-                    state["last_equity"] = state["equity"]
-
-            # ---- open new position
-            can_open = (sig != "FLAT") and (pr["pos"] is None)
-            if can_open:
-                cooldown_ok = (datetime.now(timezone.utc).timestamp() - pr["last_entry_ts"]) >= COOLDOWN_SEC
-                limit_ok = pr["trades_today"] < MAX_TRADES_PER_DAY
-
-                if cooldown_ok and limit_ok:
-                    side = "LONG" if sig == "LONG" else "SHORT"
-                    entry = last
-                    sl = entry - ATR_MULT_SL * atr_val if side == "LONG" else entry + ATR_MULT_SL * atr_val
-                    tp = entry + ATR_MULT_TP * atr_val if side == "LONG" else entry - ATR_MULT_TP * atr_val
-                    qty = position_size_from_risk(entry, sl, state["equity"])
-
-                    if qty > 0:
-                        pr["pos"] = {
-                            "side": side, "entry": entry, "sl": sl, "tp": tp,
-                            "qty": qty, "ts": datetime.now(timezone.utc).timestamp()
-                        }
-                        pr["trades_today"] += 1
-                        pr["last_entry_ts"] = datetime.now(timezone.utc).timestamp()
-
-                        patt_name = ", ".join([k for k, v in info["patt"].items() if v]) or "—"
-                        txt = (
-                            f"🔴 <b>OPEN {pair} {side}</b>"
-                            f"\n• time: {utcnow()}"
-                            f"\n• entry: {fmt(entry,5)}"
-                            f"\n• qty: {fmt(qty,6)}"
-                            f"\n• TP: {fmt(tp,5)}   SL: {fmt(sl,5)}"
-                            f"\n• signal: {patt_name}, slope {fmt(info['slope'],5)}, ATR {fmt(atr_val,5)}"
-                            f"\n• mode: {'DEMO' if DEMO_MODE else 'LIVE'}"
-                        )
-                        await tg_send(app, txt)
-
-            # отладка по запросу
-            if DEBUG_TELEMETRY:
-                pr_open = pr["pos"]
-                patt_name = ", ".join([k for k, v in patterns(df).items() if v]) or "—"
-                await tg_send(app,
-                    f"🧪 <b>DEBUG {pair}</b>"
-                    f"\nlast: {fmt(df['close'].iloc[-1],5)}  ema48_slope({EMA_SLOPE_BARS}): {fmt(ema_slope(df),5)}"
-                    f"\nATR: {fmt(atr(df, ATR_LEN).iloc[-1],5)}  patt: {patt_name}"
-                    f"\npos: {'—' if not pr_open else pr_open}"
-                )
+                    tg_send(msg)
 
         except Exception as e:
-            logger.exception(f"Loop error {pair}: {e}")
+            print(f"[ERROR] loop {pair}: {e}")
 
-        await asyncio.sleep(5 if TIMEFRAME == '1m' else 15)
+        time.sleep(TICK_SECONDS)
 
-# ================== COMMANDS ==================
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tot_tr = tot_w = 0
-    tot_pnl = 0.0
-    lines = [f"📊 <b>STATUS {utcnow()}</b>"]
+
+# -------------------- TELEGRAM --------------------
+def tg_send(text: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[TG]", text)
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text}
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[WARN] tg_send failed: {e}")
+
+def cmd_status(update, context: CallbackContext):
+    lines = [f"📊 STATUS {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC"]
     for p in PAIRS:
-        st = state["pairs"][p]["stats"]
-        tr, w, pnl = st["trades"], st["wins"], st["pnl"]
-        wr = 100.0 * w / tr if tr else 0.0
-        pos = state["pairs"][p]["pos"]
-        pos_str = "—" if not pos else f"{pos['side']} @ {fmt(pos['entry'],5)} (TP {fmt(pos['tp'],5)} / SL {fmt(pos['sl'],5)})"
-        lines.append(f"{p}• trades: {tr}  WR: {fmt(wr,2)}%  PnL: {fmt(pnl,5)}\npos: {pos_str}")
-        tot_tr += tr; tot_w += w; tot_pnl += pnl
-    wr_tot = 100.0 * tot_w / tot_tr if tot_tr else 0.0
-    total_pct = (state["equity"] / START_BALANCE - 1.0) * 100.0
+        s = stats[p]
+        wr = (s["wins"] / s["trades"] * 100.0) if s["trades"] else 0.0
+        pos = positions[p]
+        pos_line = "—"
+        if pos:
+            pos_line = f"{pos['side']} @ {pos['entry']:.5f} (TP {pos['tp']:.5f} / SL {pos['sl']:.5f})"
+        lines.append(
+            f"{p} • trades: {s['trades']}  WR: {wr:.2f}%  PnL: {s['pnl']:.5f}\n0.00000  pos: {pos_line}"
+        )
+    wr_t = (stats_total["wins"] / stats_total["trades"] * 100.0) if stats_total["trades"] else 0.0
     lines.append("—")
-    lines.append(f"TOTAL • trades: {tot_tr}  WR: {fmt(wr_tot,2)}%  PnL: {fmt(tot_pnl,5)}")
-    lines.append(f"equity: {fmt(state['equity'],5)}  ({fmt(total_pct,2)}% с начала)  leverage: {LEVERAGE}×  fee: {FEE_PCT*100:.3f}%")
-    await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
+    lines.append(f"TOTAL • trades: {stats_total['trades']}  WR: {wr_t:.2f}%  PnL: {stats_total['pnl']:.5f}")
+    lines.append(f"equity: {equity:.5f}  ({((equity-start_equity)/max(1e-9,start_equity))*100:.2f}% с начала)")
+    lines.append(f"leverage: {LEVERAGE:.1f}x  fee: {FEE_PCT*100:.3f}%")
+    update.message.reply_text("\n".join(lines))
 
-# ================== APP ==================
-def build_app() -> Application:
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("status", cmd_status))
+def build_bot():
+    if not TELEGRAM_TOKEN:
+        print("[WARN] TELEGRAM_TOKEN not set – буду логировать в stdout")
+        return None
+    req = Request(con_pool_size=4, read_timeout=20, connect_timeout=20)
+    updater = Updater(token=TELEGRAM_TOKEN, request_kwargs={"con_pool_size": 4}, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("status", cmd_status))
+    return updater
 
-    async def post_init(a: Application):
-        # Сбрасываем вебхук в любом случае (перед polling/перед новой установкой webhook)
-        try:
-            await a.bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:
-            logger.warning(f"delete_webhook warning: {e}")
+def run_bot_threads():
+    # health
+    start_health_http_server()
 
-        # фоновая торговля
-        for p in PAIRS:
-            asyncio.create_task(pair_loop(app, p))
-        logger.info("Background loops started")
+    # telegram
+    updater = build_bot()
+    if updater:
+        th = threading.Thread(target=updater.start_polling, daemon=True)
+        th.start()
+        print("Telegram polling started")
 
-        # Если выбран webhook-режим — выставим хук
-        if USE_WEBHOOK and WEBHOOK_URL:
-            try:
-                await a.bot.set_webhook(
-                    url=WEBHOOK_URL,
-                    secret_token=WEBHOOK_SECRET,
-                    drop_pending_updates=True,
-                    allowed_updates=None
-                )
-                logger.info(f"Webhook set: {WEBHOOK_URL}")
-            except Exception as e:
-                logger.error(f"set_webhook error: {e}")
+    # pairs
+    for p in PAIRS:
+        t = threading.Thread(target=pair_loop, args=(p,), daemon=True)
+        t.start()
+        print(f"Loop started for {p}")
 
-    app.post_init = post_init  # type: ignore
-    return app
+    # keep alive
+    while True:
+        time.sleep(60)
 
-def main():
-    logger.info("🤖 mybot9 started successfully!")
-    _lock_fd = ensure_single_instance()
 
-    app = build_app()
-
-    if USE_WEBHOOK and WEBHOOK_URL:
-        # В webhook-режиме НЕ запускаем отдельный health-сервер, run_webhook сам слушает порт
-        listen_port = PORT
-        listen_addr = "0.0.0.0"
-        try:
-            app.run_webhook(
-                listen=listen_addr,
-                port=listen_port,
-                url_path=WEBHOOK_PATH,
-                drop_pending_updates=True,
-                stop_signals=None,
-            )
-        except Exception as e:
-            logger.exception(f"run_webhook failed: {e}")
-            raise SystemExit(1)
-    else:
-        # polling-режим + health-сервер
-        try:
-            start_health_http_server()
-        except Exception as e:
-            logger.warning(f"Health server init skipped: {e}")
-
-        try:
-            app.run_polling(drop_pending_updates=True, stop_signals=None)
-        except Conflict as e:
-            logger.error(f"Polling Conflict 409: {e}. Another instance is polling. Exiting gracefully.")
-            raise SystemExit(0)
-        except Exception as e:
-            logger.exception(f"run_polling failed: {e}")
-            raise SystemExit(1)
-
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
-    main()
+    print("🤖 mybot9 started successfully!")
+    print(f"Mode: {'DEMO' if DEMO_MODE else 'LIVE'} | Leverage {LEVERAGE}x | Fee {FEE_PCT*100:.3f}% | Risk {RISK_PCT*100:.1f}%")
+    print(f"Pairs: {', '.join(PAIRS)} | TF {INTERVAL} | Tick {TICK_SECONDS}s")
+    run_bot_threads()
