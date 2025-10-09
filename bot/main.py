@@ -1,177 +1,126 @@
 # /workspace/bot/main.py
 import os
-import asyncio
-import json
 import math
+import json
+import asyncio
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple, Optional
+from collections import defaultdict
 
 import httpx
 import numpy as np
 import pandas as pd
-from dateutil import tz
 from loguru import logger
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, constants
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, JobQueue
+)
 
-# -----------------------------------------------------------------------------
-# ENV
-# -----------------------------------------------------------------------------
-BOT_NAME = os.getenv("BOT_NAME", "mybot9")
-TZ_NAME = os.getenv("TX", "UTC")
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")  # 1m/5m/15m/1h
-PAIRS = [p.strip().upper() for p in os.getenv(
-    "PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
-).split(",") if p.strip()]
-
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in {"1", "true", "yes"}
+# ----------------------- ENV -----------------------
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+PAIR_STR = os.getenv("PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")
+TIMEFRAME = os.getenv("TIMEFRAME", "1m").strip().lower()  # 1m/5m/15m/1h
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+TP_PCT = float(os.getenv("TP_PCT", "0.25"))  # %
+SL_PCT = float(os.getenv("SL_PCT", "0.25"))  # %
+DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0") in ("1", "true", "yes")
 
-DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0") in {"1", "true", "yes"}
+# период проверки сигналов (сек)
+TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))
 
-# стратегия #9 — параметры входа/выхода (можешь менять)
-EMA_PERIOD = 48
-EMA_SLOPE_BARS = 5
-SLOPE_LONG = 0.05     # насколько позитивный наклон для лонга
-SLOPE_SHORT = -0.05   # негативный наклон для шорта
-TP_PCT = 0.30 / 100.0   # 0.30%
-SL_PCT = 0.25 / 100.0   # 0.25%
+PAIRS = [p.strip().upper() for p in PAIR_STR.split(",") if p.strip()]
+MEXC_KLINES = "https://api.mexc.com/api/v3/klines"
 
-# -----------------------------------------------------------------------------
-# Хранилище состояния (в RAM). Если нужно переживать рестарт — подключим Redis.
-# -----------------------------------------------------------------------------
-class PairStats:
-    def __init__(self) -> None:
-        self.trades_closed: int = 0
-        self.wins: int = 0
-        self.losses: int = 0
-        self.realized_pnl_usdt: float = 0.0
-        self.last_result: Optional[str] = None  # "WIN" | "LOSS"
-        self.last_pnl_usdt: Optional[float] = None
-        self.last_pnl_pct: Optional[float] = None
-        self.last_closed_at: Optional[str] = None
+if not TOKEN or not CHAT_ID:
+    raise RuntimeError("TELEGRAM_TOKEN и TELEGRAM_CHAT_ID должны быть заданы")
+
+# ----------------------- STATE -----------------------
+class PairState:
+    def __init__(self, pair: str):
+        self.pair = pair
+        self.pos_open = False
+        self.side = None         # "LONG"|"SHORT"
+        self.entry = 0.0
+        self.qty = 0.0
+        self.tp = 0.0
+        self.sl = 0.0
+        # статистика
+        self.closed_trades = 0
+        self.wins = 0
+        self.pnl_total = 0.0
 
     @property
     def winrate(self) -> float:
-        if self.trades_closed == 0:
-            return 0.0
-        return (self.wins / self.trades_closed) * 100.0
+        return (self.wins / self.closed_trades * 100.0) if self.closed_trades else 0.0
 
+# Глобальная статистика
+GLOBAL = {
+    "closed": 0,
+    "wins": 0,
+    "pnl": 0.0,
+}
 
-class Position:
-    def __init__(self, side: str, entry: float, size: float, tp: float, sl: float) -> None:
-        self.side = side  # "LONG" | "SHORT"
-        self.entry = entry
-        self.size = size
-        self.tp = tp
-        self.sl = sl
-        self.opened_at = now_utc_str()
+# Состояние по всем парам
+STATES: dict[str, PairState] = {p: PairState(p) for p in PAIRS}
 
-    def as_dict(self) -> Dict[str, Any]:
-        return dict(side=self.side, entry=self.entry, size=self.size, tp=self.tp, sl=self.sl, opened_at=self.opened_at)
-
-
-class State:
-    def __init__(self, pairs: List[str]) -> None:
-        self.positions: Dict[str, Optional[Position]] = {p: None for p in pairs}
-        self.stats: Dict[str, PairStats] = {p: PairStats() for p in pairs}
-        self.total_realized_pnl: float = 0.0
-
-    def total_trades(self) -> int:
-        return int(sum(self.stats[p].trades_closed for p in self.stats))
-
-    def total_wins(self) -> int:
-        return int(sum(self.stats[p].wins for p in self.stats))
-
-    def total_winrate(self) -> float:
-        t = self.total_trades()
-        return (self.total_wins() / t) * 100.0 if t else 0.0
-
-
-state = State(PAIRS)
-
-# -----------------------------------------------------------------------------
-# Utils
-# -----------------------------------------------------------------------------
+# ----------------------- UTILS -----------------------
 def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-
-def pct(a: float, b: float) -> float:
-    if b == 0:
-        return 0.0
-    return (a / b) * 100.0
-
-
-def fmt_usd(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
+def fmt_money(x: float) -> str:
     return f"{x:.5f}"
 
-
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
+def fmt_pct(x: float) -> str:
     return f"{x:.2f}%"
 
+def html_escape(text: str) -> str:
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
 
-def result_emoji(win: Optional[str]) -> str:
-    if win == "WIN":
-        return "✅"
-    if win == "LOSS":
-        return "❌"
-    return "➖"
-
-
-# -----------------------------------------------------------------------------
-# Market data: MEXC kline public
-# -----------------------------------------------------------------------------
-MEXC_BASE = "https://api.mexc.com"
-
-async def get_klines(symbol: str, interval: str, limit: int = 120) -> pd.DataFrame:
-    url = f"{MEXC_BASE}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+# ----------------------- DATA -----------------------
+async def fetch_klines(pair: str, interval: str = TIMEFRAME, limit: int = 100) -> pd.DataFrame:
+    params = {"symbol": pair, "interval": interval, "limit": limit}
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, params=params)
+        r = await client.get(MEXC_KLINES, params=params)
         r.raise_for_status()
         data = r.json()
-
-    # MEXC возвращает 12 полей. Нам нужны: open time, open, high, low, close, volume
-    df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume",
-        "_c","_d","_e","_f","_g","close_time"
-    ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for col in ["open","high","low","close","volume"]:
+    # MEXC может вернуть 8..12 колонок — берём только нужные индексы
+    # [0]=open_time, [1]=open, [2]=high, [3]=low, [4]=close, [5]=volume
+    rows = [[row[0], row[1], row[2], row[3], row[4], row[5]] for row in data]
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df[["open_time","open","high","low","close","volume"]]
+    df = df.dropna().reset_index(drop=True)
+    return df
 
+# ----------------------- STRATEGY #9 -----------------------
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-# -----------------------------------------------------------------------------
-# Strategy #9
-# -----------------------------------------------------------------------------
-def detect_patterns(df: pd.DataFrame) -> Dict[str, bool]:
-    # simple candlestick patterns for the last bar
+def detect_patterns(df: pd.DataFrame) -> dict:
+    # Две последних свечи
     if len(df) < 3:
         return {"bull_engulf": False, "bear_engulf": False, "hammer": False, "shooting": False}
 
-    o1, c1 = float(df["open"].iloc[-2]), float(df["close"].iloc[-2])
-    o2, c2 = float(df["open"].iloc[-1]), float(df["close"].iloc[-1])
-    h2, l2 = float(df["high"].iloc[-1]), float(df["low"].iloc[-1])
+    o1, c1 = df["open"].iloc[-2], df["close"].iloc[-2]
+    o2, c2, h2, l2 = df["open"].iloc[-1], df["close"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1]
+    body1 = abs(c1 - o1)
+    body2 = abs(c2 - o2)
+    rng2 = h2 - l2
 
-    bull_engulf = (c1 < o1) and (c2 > o2) and (c2 >= o1) and (o2 <= c1)
-    bear_engulf = (c1 > o1) and (c2 < o2) and (o2 >= c1) and (c2 <= o1)
+    # Поглощения
+    bull_engulf = (c1 < o1) and (c2 > o2) and (o2 <= c1) and (c2 >= o1) and (body2 > body1*1.1)
+    bear_engulf = (c1 > o1) and (c2 < o2) and (o2 >= c1) and (c2 <= o1) and (body2 > body1*1.1)
 
-    body = abs(c2 - o2)
-    upper = h2 - max(c2, o2)
-    lower = min(c2, o2) - l2
-    small = (body > 0) and (upper / body > 2.5 or lower / body > 2.5)
-
-    hammer = small and lower > (2 * body) and upper < body
-    shooting = small and upper > (2 * body) and lower < body
+    # “молот” / “падающая звезда”
+    lower_wick = min(o2, c2) - l2
+    upper_wick = h2 - max(o2, c2)
+    hammer = (body2 > 0) and (lower_wick > body2*2.5) and (upper_wick < body2*0.5)
+    shooting = (body2 > 0) and (upper_wick > body2*2.5) and (lower_wick < body2*0.5)
 
     return {
         "bull_engulf": bool(bull_engulf),
@@ -180,268 +129,184 @@ def detect_patterns(df: pd.DataFrame) -> Dict[str, bool]:
         "shooting": bool(shooting),
     }
 
+def strategy9(df: pd.DataFrame) -> dict:
+    """
+    Возвращает сигнал:
+    {"signal": "LONG"|"SHORT"|None, "reason": "...", "ema_slope": float, "patterns": {...}}
+    """
+    if len(df) < 60:
+        return {"signal": None, "reason": "not_enough_bars", "ema_slope": 0.0, "patterns": {}}
 
-def decision_from_indicators(df: pd.DataFrame) -> str:
-    # returns "LONG" | "SHORT" | "FLAT"
-    if len(df) < max(EMA_PERIOD, EMA_SLOPE_BARS + 1):
-        return "FLAT"
-
-    ema = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-    last = float(df["close"].iloc[-1])
-
-    # slope of ema over last EMA_SLOPE_BARS
-    y2 = float(ema.iloc[-1])
-    y1 = float(ema.iloc[-1 - EMA_SLOPE_BARS])
-    slope = (y2 - y1) / EMA_SLOPE_BARS  # абсолютный шаг
-    slope_pct = pct(slope, y1)
-
+    df = df.copy()
+    df["ema48"] = ema(df["close"], 48)
+    # угловая за последние 5 баров
+    slope = float(df["ema48"].iloc[-1] - df["ema48"].iloc[-6])
     patt = detect_patterns(df)
 
-    go_long = (slope_pct >= SLOPE_LONG) and (patt["bull_engulf"] or patt["hammer"])
-    go_short = (slope_pct <= SLOPE_SHORT) and (patt["bear_engulf"] or patt["shooting"])
+    long_ok = slope > 0 and (patt["bull_engulf"] or patt["hammer"])
+    short_ok = slope < 0 and (patt["bear_engulf"] or patt["shooting"])
 
-    if go_long:
-        return "LONG"
-    if go_short:
-        return "SHORT"
-    return "FLAT"
+    if long_ok and not short_ok:
+        return {"signal": "LONG", "reason": "patt+ema_up", "ema_slope": slope, "patterns": patt}
+    if short_ok and not long_ok:
+        return {"signal": "SHORT", "reason": "patt+ema_down", "ema_slope": slope, "patterns": patt}
+    return {"signal": None, "reason": "no_setup", "ema_slope": slope, "patterns": patt}
 
-
-def calc_tp_sl(entry: float, side: str) -> Tuple[float, float]:
+# ----------------------- TRADING (demo) -----------------------
+async def open_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: float, side: str):
+    st.pos_open = True
+    st.side = side
+    st.entry = price
+    st.qty = TRADE_SIZE
     if side == "LONG":
-        tp = entry * (1 + TP_PCT)
-        sl = entry * (1 - SL_PCT)
+        st.tp = price * (1 + TP_PCT/100)
+        st.sl = price * (1 - SL_PCT/100)
     else:
-        tp = entry * (1 - TP_PCT)
-        sl = entry * (1 + SL_PCT)
-    return (tp, sl)
+        st.tp = price * (1 - TP_PCT/100)
+        st.sl = price * (1 + SL_PCT/100)
 
-
-# -----------------------------------------------------------------------------
-# Telegram
-# -----------------------------------------------------------------------------
-async def tg_send(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
-        return
-    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-
-
-def status_block_for_pair(pair: str) -> str:
-    st = state.stats[pair]
-    pos = state.positions[pair]
-    wr = st.winrate
-    pnl = st.realized_pnl_usdt
-
-    last_line = ""
-    if st.last_result is not None:
-        last_line = (f"\n  last: {result_emoji(st.last_result)} "
-                     f"{fmt_usd(st.last_pnl_usdt)} USDT ({fmt_pct(st.last_pnl_pct)}) "
-                     f"at {st.last_closed_at or '—'}")
-
-    pos_line = "—"
-    if pos:
-        pos_line = (f"{pos.side} @ {pos.entry:.5f} "
-                    f"(TP {pos.tp:.5f} / SL {pos.sl:.5f})")
-
-    return (
-        f"{pair} • trades: {st.trades_closed}  WR: {wr:.1f}%  PnL: {fmt_usd(pnl)}"
-        f"\n  pos: {pos_line}{last_line}"
+    icon = "🟢" if side == "LONG" else "🔴"
+    await ctx.bot.send_message(
+        CHAT_ID,
+        (
+            f"{icon} <b>OPEN</b> {st.pair} {side}\n"
+            f"• time: {now_utc_str()}\n"
+            f"• entry: <code>{fmt_money(st.entry)}</code>\n"
+            f"• qty: <code>{st.qty}</code>\n"
+            f"• TP: <code>{fmt_money(st.tp)}</code>  SL: <code>{fmt_money(st.sl)}</code>\n"
+            f"• mode: {'DEMO' if DEMO_MODE else 'LIVE'}"
+        ),
+        parse_mode=constants.ParseMode.HTML
     )
 
+async def close_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: float, reason: str):
+    if not st.pos_open:
+        return
+    side = st.side
+    pnl = (price - st.entry) * st.qty if side == "LONG" else (st.entry - price) * st.qty
+    st.pos_open = False
+    st.side = None
+    st.entry = 0.0
+    st.qty = 0.0
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    header = f"📊 STATUS {now_utc_str()}"
-    lines = [header]
-    for p in PAIRS:
-        lines.append(status_block_for_pair(p))
-    lines.append("\n—"*20)
-    lines.append(f"TOTAL • trades: {state.total_trades()}  WR: {state.total_winrate():.1f}%"
-                 f"  PnL: {fmt_usd(state.total_realized_pnl)}")
-    await tg_send(context, "\n".join(lines))
+    st.closed_trades += 1
+    GLOBAL["closed"] += 1
+    GLOBAL["pnl"] += pnl
+    st.pnl_total += pnl
+    win = pnl >= 0
+    if win:
+        st.wins += 1
+        GLOBAL["wins"] += 1
 
+    icon = "✅" if win else "❌"
+    sign = "+" if pnl >= 0 else "−"
+    await ctx.bot.send_message(
+        CHAT_ID,
+        (
+            f"{icon} <b>CLOSE</b> {st.pair} ({reason})\n"
+            f"• time: {now_utc_str()}\n"
+            f"• exit: <code>{fmt_money(price)}</code>\n"
+            f"• PnL: <b>{sign}{fmt_money(abs(pnl))}</b>\n"
+            f"• pair stats: trades {st.closed_trades}, WR {fmt_pct(st.winrate)}, PnL {fmt_money(st.pnl_total)}\n"
+            f"• total: trades {GLOBAL['closed']}, WR {fmt_pct((GLOBAL['wins']/GLOBAL['closed']*100) if GLOBAL['closed'] else 0)}, PnL {fmt_money(GLOBAL['pnl'])}"
+        ),
+        parse_mode=constants.ParseMode.HTML
+    )
 
-# -----------------------------------------------------------------------------
-# Execution (DEMO): эмулируем исполнение по TP/SL
-# -----------------------------------------------------------------------------
-def unrealized_pnl(entry: float, side: str, last: float, size: float) -> float:
-    if side == "LONG":
-        return (last - entry) * size
-    else:
-        return (entry - last) * size
-
-
-def realized_pnl(entry: float, exit: float, side: str, size: float) -> float:
-    if side == "LONG":
-        return (exit - entry) * size
-    else:
-        return (entry - exit) * size
-
-
-async def process_pair(pair: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    df = await get_klines(pair, TIMEFRAME, limit=120)
-    last_close = float(df["close"].iloc[-1])
-
-    pos = state.positions[pair]
-
-    # 1) Если позиция открыта — проверим TP/SL (для DEMO симуляции)
-    if pos is not None:
-        closed = False
-        exit_price = None
-        result = None  # "WIN" | "LOSS"
-
-        if pos.side == "LONG":
-            if last_close >= pos.tp:
-                closed = True
-                exit_price = pos.tp
-                result = "WIN"
-            elif last_close <= pos.sl:
-                closed = True
-                exit_price = pos.sl
-                result = "LOSS"
-        else:  # SHORT
-            if last_close <= pos.tp:
-                closed = True
-                exit_price = pos.tp
-                result = "WIN"
-            elif last_close >= pos.sl:
-                closed = True
-                exit_price = pos.sl
-                result = "LOSS"
-
-        if closed and exit_price is not None:
-            pnl = realized_pnl(pos.entry, exit_price, pos.side, pos.size)
-            pnl_pct = pct(abs(exit_price - pos.entry), pos.entry) * (1 if result == "WIN" else 1)  # просто информативно
-
-            st = state.stats[pair]
-            st.trades_closed += 1
-            if result == "WIN":
-                st.wins += 1
-            else:
-                st.losses += 1
-            st.realized_pnl_usdt += pnl
-            st.last_result = result
-            st.last_pnl_usdt = pnl
-            st.last_pnl_pct = pnl_pct if pos.side == "LONG" else pnl_pct  # симметрично
-            st.last_closed_at = now_utc_str()
-            state.total_realized_pnl += pnl
-
-            emoji = "✅" if result == "WIN" else "❌"
-            msg = (
-                f"{emoji} {pair} CLOSED {pos.side} {pos.size:g} @ {exit_price:.5f}\n"
-                f"• entry: {pos.entry:.5f}\n"
-                f"• PnL: {pnl:+.5f} USDT ({fmt_pct(st.last_pnl_pct)})\n"
-                f"• balance: {fmt_usd(state.total_realized_pnl)} USDT\n"
-                f"• trades: {st.trades_closed}  WR(pair): {st.winrate:.1f}%  WR(total): {state.total_winrate():.1f}%"
-            )
-            await tg_send(context, msg)
-
-            # позицию закрыли
-            state.positions[pair] = None
-            pos = None
-
-    # 2) Если позиции нет — ищем сигнал
-    if pos is None:
-        side = decision_from_indicators(df)
-        if side in {"LONG", "SHORT"}:
-            entry = last_close
-            tp, sl = calc_tp_sl(entry, side)
-            size = TRADE_SIZE  # DEMO размер
-
-            state.positions[pair] = Position(side, entry, size, tp, sl)
-            await tg_send(
-                context,
-                f"🟢 OPEN {pair} {side} {size:g} @ {entry:.5f} "
-                f"(TP {tp:.5f} / SL {sl:.5f})"
-            )
-
-    # 3) Отладка (по желанию)
-    if DEBUG_TELEMETRY:
-        patt = detect_patterns(df)
-        ema = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-        y2 = float(ema.iloc[-1])
-        y1 = float(ema.iloc[-1 - EMA_SLOPE_BARS]) if len(ema) > EMA_SLOPE_BARS else y2
-        slope_pct = pct((y2 - y1) / EMA_SLOPE_BARS, y1)
-
-        pos_str = "—" if state.positions[pair] is None else f"{state.positions[pair].side} @ {state.positions[pair].entry:.5f}"
-        dbg = (
-            f"🧪 DEBUG {pair}\n"
-            f"• last_close: {last_close:.5f}\n"
-            f"• EMA{safestr(EMA_PERIOD)}_slope({EMA_SLOPE_BARS} bars): {slope_pct:.6f}\n"
-            f"• patterns: {json.dumps({k: bool(v) for k, v in patt.items()}, ensure_ascii=False)}\n"
-            f"• pos: {pos_str}"
-        )
-        await tg_send(context, dbg)
-
-
-def safestr(x: Any) -> str:
+# ----------------------- JOB: per pair -----------------------
+async def pair_job(ctx: ContextTypes.DEFAULT_TYPE):
+    pair = ctx.job.data["pair"]
+    st = STATES[pair]
     try:
-        return str(x)
-    except Exception:
-        return "?"
+        df = await fetch_klines(pair, TIMEFRAME, 150)
+        if df.empty:
+            return
+        last = float(df["close"].iloc[-1])
 
+        # если позиция открыта — проверяем TP/SL
+        if st.pos_open:
+            if st.side == "LONG":
+                if last >= st.tp:
+                    await close_position(ctx, st, last, "TP")
+                    return
+                if last <= st.sl:
+                    await close_position(ctx, st, last, "SL")
+                    return
+            else:  # SHORT
+                if last <= st.tp:
+                    await close_position(ctx, st, last, "TP")
+                    return
+                if last >= st.sl:
+                    await close_position(ctx, st, last, "SL")
+                    return
 
-# -----------------------------------------------------------------------------
-# Scheduler
-# -----------------------------------------------------------------------------
-async def run_loop(app: Application) -> None:
-    # единый тикер: раз в 10 секунд обрабатываем все пары (последовательно)
-    while True:
-        try:
-            for p in PAIRS:
-                await process_pair(p, app.bot._application_context)  # type: ignore
-        except Exception as e:
-            logger.exception(e)
-        await asyncio.sleep(10)
+        # иначе ищем новый сигнал
+        sig = strategy9(df)
+        if DEBUG_TELEMETRY and (sig["signal"] or (ctx.job.data["dbg_tick"] := (ctx.job.data.get("dbg_tick", 0)+1)) % 12 == 0):
+            # раз в 12 тиков (≈2 минуты при 10s) или при сигнале
+            await ctx.bot.send_message(
+                CHAT_ID,
+                (
+                    f"🧪 <b>DEBUG</b>\n"
+                    f"• pair: <b>{pair}</b>\n"
+                    f"• last_close: <code>{fmt_money(last)}</code>\n"
+                    f"• EMA48_slope(5 bars): <code>{sig['ema_slope']:.6f}</code>\n"
+                    f"• patterns: <code>{json.dumps(sig['patterns'])}</code>\n"
+                    f"• pos_open: <b>{st.pos_open}</b>"
+                ),
+                parse_mode=constants.ParseMode.HTML
+            )
 
+        if not st.pos_open and sig["signal"] in ("LONG", "SHORT"):
+            await open_position(ctx, st, last, sig["signal"])
 
-# -----------------------------------------------------------------------------
-# Telegram wiring
-# -----------------------------------------------------------------------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await tg_send(context, f"✅ {BOT_NAME} is running with strategy #9 "
-                           f"({'DEMO' if DEMO_MODE else 'LIVE'})\nPAIRS: {', '.join(PAIRS)} TF: {TIMEFRAME}")
+    except Exception as e:
+        logger.exception(e)
 
-def build_application() -> Application:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
+# ----------------------- COMMANDS -----------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(
+        f"✅ mybot9 running ({'DEMO' if DEMO_MODE else 'LIVE'})\n"
+        f"PAIRS: <code>{', '.join(PAIRS)}</code>  TF: <b>{TIMEFRAME}</b>"
+    )
+
+def pair_status_line(st: PairState) -> str:
+    pos = "—"
+    if st.pos_open:
+        pos = f"{st.side} @ {fmt_money(st.entry)} (TP {fmt_money(st.tp)}/ SL {fmt_money(st.sl)})"
+    return (f"{st.pair}• trades: {st.closed_trades}  WR: {fmt_pct(st.winrate)}  "
+            f"PnL: {fmt_money(st.pnl_total)}\n0.00000  pos: {pos}")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["📊 <b>STATUS</b> " + now_utc_str()]
+    for p in PAIRS:
+        st = STATES[p]
+        lines.append(pair_status_line(st))
+    total_wr = (GLOBAL["wins"] / GLOBAL["closed"] * 100) if GLOBAL["closed"] else 0.0
+    lines.append(f"—\nTOTAL • trades: {GLOBAL['closed']}  WR: {fmt_pct(total_wr)}  PnL: {fmt_money(GLOBAL['pnl'])}")
+    await update.message.reply_html("\n".join(lines))
+
+# ----------------------- MAIN -----------------------
+def build_app() -> Application:
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+
+    # Планируем по джобам одну задачу на каждую пару
+    for p in PAIRS:
+        app.job_queue.run_repeating(
+            pair_job,
+            interval=TICK_SECONDS,
+            first=2,  # старт через 2 сек после запуска
+            data={"pair": p}
+        )
     return app
 
-
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
-async def run_bot() -> None:
-    logger.info(f"🤖 {BOT_NAME} started successfully!")
-
-    if not TELEGRAM_TOKEN or TELEGRAM_CHAT_ID == 0:
-        logger.warning("Telegram credentials missing; the bot will run headless.")
-
-    app = build_application()
-
-    # ВАЖНО: initialize → start → post_init tasks → run loop
-    await app.initialize()
-    await app.start()
-
-    # Пихаем bot контекст для удобства в process_pair
-    app.bot._application_context = ContextTypes.DEFAULT_TYPE(application=app)  # type: ignore
-
-    # Пингуем старт
-    try:
-        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                                   text=f"✅ {BOT_NAME} booted. Mode: {'DEMO' if DEMO_MODE else 'LIVE'}. TF: {TIMEFRAME}.")
-    except Exception:
-        pass
-
-    # Поднимаем основной цикл
-    loop_task = asyncio.create_task(run_loop(app))
-
-    # Полноценный idle
-    try:
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)  # типовой idle в PTB v21
-    except Exception:
-        # Если updater не сконфигурирован (webhook/healthcheck) — просто держим фоновые задачи
-        await loop_task
+def main():
+    logger.info("🤖 mybot9 started successfully!")
+    app = build_app()
+    # Стартуем polling (инициализация и запуск делаются внутри)
+    app.run_polling(allowed_updates=constants.Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    main()
