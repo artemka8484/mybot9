@@ -1,229 +1,285 @@
-# mybot9/bot/main.py
-import asyncio, os, math
-from datetime import datetime, timezone
+# bot/main.py
+import os
+import asyncio
 import json
-import pandas as pd
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone
+
 import numpy as np
+import pandas as pd
 import httpx
 from loguru import logger
+from telegram import Bot
 
-# ------------ ENV ------------
-API_KEY     = os.getenv("MEXC_API_KEY", "")
-API_SECRET  = os.getenv("MEXC_API_SECRET", "")
-TELE_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
-TELE_CHAT   = os.getenv("TELEGRAM_CHAT_ID", "")
-TIMEFRAME   = os.getenv("TIMEFRAME", "1m")
-DEMO_MODE   = os.getenv("DEMO_MODE", "true").lower() in ("1","true","yes")
-PAIR_STR    = os.getenv("PAIRS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT")
-PAIRS       = [p.strip().upper() for p in PAIR_STR.split(",") if p.strip()]
+# -----------------------
+# Конфигурация из ENV
+# -----------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in {"1", "true", "yes", "on"}
+DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0") in {"1", "true", "yes", "on"}
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
 
-DEBUG_TEL   = os.getenv("DEBUG_TELEMETRY","0") in ("1","true","yes")
+# Пары: через запятую. Пример: "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+PAIRS = [
+    p.strip().upper()
+    for p in os.getenv(
+        "PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
+    ).split(",")
+    if p.strip()
+]
 
-# торговые параметры (бережно)
-EMA_LEN     = 48
-ATR_LEN     = 14
-RISK_RR     = 1.5   # цель = 1.5*ATR
-SLEEP_SEC   = 5     # пауза между циклами
-BARS_NEED   = max(EMA_LEN, ATR_LEN) + 5
+# Таймфрейм: "1m", "5m", "15m" ... (для MEXC)
+TIMEFRAME = os.getenv("TIMEFRAME", "1m").lower()
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+# Пауза между циклами по каждой паре (сек). Делаем короче таймфрейма.
+TF_TO_SECONDS = {
+    "1m": 60,
+    "3m": 180,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+}
+CYCLE_SLEEP = max(5, min(20, TF_TO_SECONDS.get(TIMEFRAME, 60) // 3))
 
-# ------------ Telegram ------------
-async def tg_send(text: str):
-    if not (TELE_TOKEN and TELE_CHAT): return
-    url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
-    payload = {"chat_id": int(TELE_CHAT), "text": text}
-    timeout = httpx.Timeout(10.0)
-    async with httpx.AsyncClient(timeout=timeout) as cl:
-        try:
-            await cl.post(url, json=payload)
-        except Exception as e:
-            logger.warning(f"Telegram send failed: {e}")
+# Глобальный Telegram-бот
+tg_bot: Bot | None = None
 
-def utc_now_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-# ------------ Data ------------
-async def get_klines(pair: str, interval: str, limit: int = 200):
-    params = {"symbol": pair, "interval": interval, "limit": limit}
-    timeout = httpx.Timeout(10.0)
-    async with httpx.AsyncClient(timeout=timeout) as cl:
-        r = await cl.get(BINANCE_KLINES, params=params)
+# -----------------------
+# HTTP-сервер для healthcheck (порт 8080)
+# -----------------------
+class _Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_error(404)
+
+    def log_message(self, *_args, **_kwargs):
+        # глушим стандартный спам http.server
+        return
+
+
+def _run_http():
+    srv = HTTPServer(("0.0.0.0", 8080), _Ping)
+    logger.info("HTTP health server started on :8080")
+    srv.serve_forever()
+
+
+# -----------------------
+# Хелперы
+# -----------------------
+async def send_telegram(text: str):
+    """Безопасно отправляем сообщение в Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        await tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
+
+
+async def fetch_klines(symbol: str, interval: str, limit: int = 120) -> pd.DataFrame:
+    """
+    Берём свечи с MEXC (v3), формат массива: 8 полей на свечу.
+    https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=120
+    """
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
-        data = r.json()
-    # колонки binance: [open_time, open, high, low, close, volume, close_time, ...]
-    arr = []
-    for row in data:
-        arr.append([
-            int(row[0]),
-            float(row[1]), float(row[2]), float(row[3]), float(row[4]),
-            float(row[5])
-        ])
-    df = pd.DataFrame(arr, columns=["ts","open","high","low","close","vol"])
-    df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        data = r.json()  # list[list]
+    # MEXC kline -> 8 колонок
+    cols = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+    ]
+    df = pd.DataFrame(data, columns=cols)
+    # приведение типов
+    for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     return df
 
-# ------------ Indicators & patterns ------------
-def ema(series: pd.Series, n: int):
-    return series.ewm(span=n, adjust=False).mean()
 
-def atr(df: pd.DataFrame, n: int):
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
-def is_bull_engulf(df: pd.DataFrame):
-    # пред. медвежья, текущая бычья и тело покрывает предыдущее
-    prev = df.iloc[-2]; cur = df.iloc[-1]
-    return (prev.close < prev.open) and (cur.close > cur.open) and \
-           (cur.close >= prev.open) and (cur.open <= prev.close)
 
-def is_bear_engulf(df: pd.DataFrame):
-    prev = df.iloc[-2]; cur = df.iloc[-1]
-    return (prev.close > prev.open) and (cur.close < cur.open) and \
-           (cur.open >= prev.close) and (cur.close <= prev.open)
-
-def is_hammer(row):
-    body = abs(row.close - row.open)
-    upper = row.high - max(row.close,row.open)
-    lower = min(row.close,row.open) - row.low
-    return lower > 2*body and upper < body
-
-def is_shooting(row):
-    body = abs(row.close - row.open)
-    upper = row.high - max(row.close,row.open)
-    lower = min(row.close,row.open) - row.low
-    return upper > 2*body and lower < body
-
-# ------------ Trading state per pair ------------
-class PairState:
-    def __init__(self):
-        self.position = None  # {"side":"LONG/SHORT","entry":float,"sl":float,"tp":float}
-
-STATES = {p: PairState() for p in PAIRS}
-
-# ------------ Strategy 9 core ------------
-def strategy_signal(df: pd.DataFrame):
+def candle_patterns(df: pd.DataFrame) -> dict:
     """
-    Возвращает ('LONG'|'SHORT'|None, info_dict)
+    Очень простые (игрушечные) правила паттернов:
+    - бычье поглощение
+    - медвежье поглощение
+    - молот
+    - падающая звезда
     """
-    if len(df) < BARS_NEED:
-        return None, {"reason":"not_enough_bars"}
+    if len(df) < 3:
+        return {"bull_engulf": False, "bear_engulf": False, "hammer": False, "shooting": False}
 
-    df = df.copy()
-    df["ema48"] = ema(df["close"], EMA_LEN)
-    df["atr"]   = atr(df, ATR_LEN)
-
-    slope = df["ema48"].iloc[-1] - df["ema48"].iloc[-6]  # наклон за ~5 баров
-    cur   = df.iloc[-1]
-
-    patt_long  = is_bull_engulf(df) or is_hammer(cur)
-    patt_short = is_bear_engulf(df) or is_shooting(cur)
-
-    long_ok  = slope > 0 and patt_long
-    short_ok = slope < 0 and patt_short
-
-    info = {
-        "last_close": cur["close"],
-        "ema48_slope_5": float(slope),
-        "patt": {"bull_engulf":is_bull_engulf(df),
-                 "bear_engulf":is_bear_engulf(df),
-                 "hammer":is_hammer(cur),
-                 "shooting":is_shooting(cur)}
-    }
-
-    if long_ok:  return "LONG", info
-    if short_ok: return "SHORT", info
-    return None, info
-
-# ------------ Order emulation/real ------------
-async def execute_trade(pair: str, side: str, price: float, atr_val: float):
-    qty = float(os.getenv("TRADE_SIZE","0.001"))
-    if DEMO_MODE:
-        await tg_send(
-            f"🧪 DEMO trade\n• {side} {qty} {pair} @ {price:.2f}\n• Время: {utc_now_str()}\n• Стратегия: #9\n• Исполнение: без реального ордера"
-        )
-        return
-    # TODO: здесь позже подключим реальный MEXC/OKX/… REST для ордеров.
-    await tg_send(
-        f"✅ LIVE order SENT\n• {side} {qty} {pair} @ ~{price:.2f}\n• time: {utc_now_str()}"
+    c1_open, c1_close, c1_high, c1_low = (
+        float(df["open"].iloc[-2]),
+        float(df["close"].iloc[-2]),
+        float(df["high"].iloc[-2]),
+        float(df["low"].iloc[-2]),
+    )
+    c2_open, c2_close, c2_high, c2_low = (
+        float(df["open"].iloc[-1]),
+        float(df["close"].iloc[-1]),
+        float(df["high"].iloc[-1]),
+        float(df["low"].iloc[-1]),
     )
 
-# ------------ Worker per pair ------------
-async def run_pair(pair: str):
-    state = STATES[pair]
-    await tg_send(f"✅ mybot9 running ({'DEMO' if DEMO_MODE else 'LIVE'})\nPAIR: {pair} TF: {TIMEFRAME}")
+    # engulfing: тело текущей свечи длиннее и покрывает пред.тело
+    bull_engulf = (c2_close > c2_open) and (c1_close < c1_open) and (c2_close >= c1_open) and (c2_open <= c1_close)
+    bear_engulf = (c2_close < c2_open) and (c1_close > c1_open) and (c2_open >= c1_close) and (c2_close <= c1_open)
+
+    # hammer / shooting star: соотношения теней (очень грубо)
+    body = abs(c2_close - c2_open)
+    upper = c2_high - max(c2_close, c2_open)
+    lower = min(c2_close, c2_open) - c2_low
+
+    hammer = (lower > body * 2) and (upper < body * 0.5)
+    shooting = (upper > body * 2) and (lower < body * 0.5)
+
+    return {
+        "bull_engulf": bool(bull_engulf),
+        "bear_engulf": bool(bear_engulf),
+        "hammer": bool(hammer),
+        "shooting": bool(shooting),
+    }
+
+
+def strategy9(df: pd.DataFrame) -> tuple[str | None, dict]:
+    """
+    Правила #9:
+    - EMA48, EMA14
+    - Угол (наклон) EMA48 по последним 5 барам
+    - Сигнал BUY: наклон > 0 и (bull_engulf или hammer)
+    - Сигнал SELL: наклон < 0 и (bear_engulf или shooting)
+    Возвращает (signal, info)
+    """
+    if len(df) < 60:
+        return None, {}
+
+    df = df.copy()
+    df["ema14"] = ema(df["close"], 14)
+    df["ema48"] = ema(df["close"], 48)
+
+    # Наклон EMA48: линейная регрессия по 5 последним точкам
+    tail = df["ema48"].tail(5).to_numpy(dtype=float)
+    x = np.arange(len(tail), dtype=float)
+    slope = float(np.polyfit(x, tail, 1)[0])  # коэффициент при x
+
+    patt = candle_patterns(df)
+
+    signal = None
+    if slope > 0 and (patt["bull_engulf"] or patt["hammer"]):
+        signal = "BUY"
+    elif slope < 0 and (patt["bear_engulf"] or patt["shooting"]):
+        signal = "SELL"
+
+    info = {
+        "last_close": float(df["close"].iloc[-1]),
+        "ema48_slope_5": float(slope),
+        "patt": {k: bool(v) for k, v in patt.items()},  # гарантируем обычные bool
+    }
+    return signal, info
+
+
+async def execute_demo(symbol: str, side: str, price: float):
+    """Фейковое исполнение сделки (демо)."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    text = (
+        f"🧪 DEMO trade • {symbol}"
+        f"\n• {side} {TRADE_SIZE:g} @ {price:.4f}"
+        f"\n• Время: {ts}"
+        f"\n• Стратегия: #9"
+        f"\n• Исполнение: без реального ордера"
+    )
+    await send_telegram(text)
+
+
+async def run_pair(symbol: str):
+    """Цикл по конкретной паре."""
+    pos_open = False  # простейшее состояние позиции
+    await send_telegram(f"✅ mybot9 running (DEMO) PAIR: {symbol} TF: {TIMEFRAME}")
 
     while True:
         try:
-            df = await get_klines(pair, TIMEFRAME, limit=300)
-            signal, info = strategy_signal(df)
+            df = await fetch_klines(symbol, TIMEFRAME, limit=150)
+            signal, info = strategy9(df)
 
-            if DEBUG_TEL:
-                await tg_send(
+            # DEBUG-вывод (только если включен)
+            if DEBUG_TELEMETRY:
+                patt = info.get("patt", {})
+                # json.dumps падал на numpy.bool_ -> приводим заранее
+                patt = {k: bool(v) for k, v in patt.items()}
+                debug_text = (
                     "🧪 DEBUG"
-                    f"\n• pair: {pair}"
-                    f"\n• last_close: {info.get('last_close'):.2f}"
-                    f"\n• EMA48_slope(5): {info.get('ema48_slope_5'):.4f}"
-                    f"\n• patterns: {json.dumps(info.get('patt'), ensure_ascii=False)}"
-                    f"\n• pos_open: {bool(state.position)}"
+                    f"\n• pair: {symbol}"
+                    f"\n• last_close: {float(info.get('last_close', 0)):.5f}"
+                    f"\n• EMA48_slope(5 bars): {float(info.get('ema48_slope_5', 0)):.6f}"
+                    f"\n• patterns: {json.dumps(patt, ensure_ascii=False)}"
+                    f"\n• pos_open: {bool(pos_open)}"
                 )
+                await send_telegram(debug_text)
 
-            # Если позиции нет — ищем вход
-            if state.position is None and signal:
-                cur = df.iloc[-1]
-                atr_val = float(df["atr"].iloc[-1])
-                entry = float(cur["close"])
-                if signal == "LONG":
-                    sl = entry - atr_val
-                    tp = entry + RISK_RR * atr_val
-                    state.position = {"side":"LONG","entry":entry,"sl":sl,"tp":tp}
-                    await execute_trade(pair, "BUY", entry, atr_val)
-                elif signal == "SHORT":
-                    sl = entry + atr_val
-                    tp = entry - RISK_RR * atr_val
-                    state.position = {"side":"SHORT","entry":entry,"sl":sl,"tp":tp}
-                    await execute_trade(pair, "SELL", entry, atr_val)
-
-            # Менеджмент открытой позиции (по цене close)
-            if state.position:
-                cur_price = float(df.iloc[-1]["close"])
-                pos = state.position
-                hit_tp = (pos["side"]=="LONG" and cur_price>=pos["tp"]) or \
-                         (pos["side"]=="SHORT" and cur_price<=pos["tp"])
-                hit_sl = (pos["side"]=="LONG" and cur_price<=pos["sl"]) or \
-                         (pos["side"]=="SHORT" and cur_price>=pos["sl"])
-
-                if hit_tp or hit_sl:
-                    res = "TP" if hit_tp else "SL"
-                    await tg_send(
-                        f"📘 EXIT {res}\n• {pair} {pos['side']} @ {cur_price:.2f}\n"
-                        f"• entry: {pos['entry']:.2f}  tp: {pos['tp']:.2f}  sl: {pos['sl']:.2f}\n"
-                        f"• time: {utc_now_str()}"
-                    )
-                    state.position = None
+            # Простейшая логика позиций (для демо)
+            if signal == "BUY" and not pos_open:
+                await execute_demo(symbol, "BUY", float(info.get("last_close", 0.0)))
+                pos_open = True
+            elif signal == "SELL" and pos_open:
+                await execute_demo(symbol, "SELL", float(info.get("last_close", 0.0)))
+                pos_open = False
 
         except Exception as e:
+            # Лог + уведомление, но не падаем
             logger.exception(e)
+            await send_telegram(f"⚠️ Ошибка по паре {symbol}: {e}")
 
-        await asyncio.sleep(SLEEP_SEC)
+        await asyncio.sleep(CYCLE_SLEEP)
 
-# ------------ Runner ------------
+
 async def run_bot():
+    global tg_bot
     logger.info("🤖 mybot9 started successfully!")
-    tasks = [asyncio.create_task(run_pair(p)) for p in PAIRS]
-    while True:
-        # health ping
-        logger.info("Bot is alive... waiting for signals")
-        await asyncio.sleep(10)
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        tg_bot = Bot(TELEGRAM_TOKEN)
+        mode_note = "(DEMO mode active)" if DEMO_MODE else "(LIVE)"
+        await send_telegram(f"✅ mybot9 is running with strategy #9 {mode_note}")
+    else:
+        logger.warning("TELEGRAM_* не заданы — оповещения отключены.")
+
+    # запускаем циклы по всем парам
+    tasks = []
+    delay = 0
+    for p in PAIRS:
+        # Небольшой сдвиг старта, чтобы не фетчить всё одновременно
+        async def _delayed(pair=p, d=delay):
+            await asyncio.sleep(d)
+            await run_pair(pair)
+        tasks.append(asyncio.create_task(_delayed()))
+        delay += 2  # по 2 секунды сдвига
+
+    await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        logger.warning("Bot stopped manually.")
+    # HTTP health server в отдельном потоке
+    threading.Thread(target=_run_http, daemon=True).start()
+    asyncio.run(run_bot())
