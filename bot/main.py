@@ -1,29 +1,14 @@
 # /workspace/bot/main.py
 import os
 import json
-import math
-import threading
-from http.server import SimpleHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 import httpx
-import numpy as np
 import pandas as pd
 from loguru import logger
 
 from telegram import Update, constants
 from telegram.ext import Application, CommandHandler, ContextTypes
-
-# ----------------------- tiny HTTP server for Koyeb healthcheck -----------------------
-def start_health_http_server():
-    port = int(os.getenv("PORT", "8080"))
-    class Quiet(SimpleHTTPRequestHandler):
-        def log_message(self, *args, **kwargs):  # no noisy access logs
-            pass
-    httpd = HTTPServer(("0.0.0.0", port), Quiet)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    logger.info(f"Health HTTP server on 0.0.0.0:{port}")
 
 # ----------------------- ENV -----------------------
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -32,8 +17,8 @@ PAIR_STR = os.getenv("PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")
 TIMEFRAME = os.getenv("TIMEFRAME", "1m").strip().lower()
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
-TP_PCT = float(os.getenv("TP_PCT", "0.25"))
-SL_PCT = float(os.getenv("SL_PCT", "0.25"))
+TP_PCT = float(os.getenv("TP_PCT", "0.25"))  # %
+SL_PCT = float(os.getenv("SL_PCT", "0.25"))  # %
 DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0") in ("1", "true", "yes")
 TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))
 
@@ -56,6 +41,7 @@ class PairState:
         self.closed_trades = 0
         self.wins = 0
         self.pnl_total = 0.0
+
     @property
     def winrate(self) -> float:
         return (self.wins / self.closed_trades * 100.0) if self.closed_trades else 0.0
@@ -63,7 +49,7 @@ class PairState:
 GLOBAL = {"closed": 0, "wins": 0, "pnl": 0.0}
 STATES: dict[str, PairState] = {p: PairState(p) for p in PAIRS}
 
-# ----------------------- utils -----------------------
+# ----------------------- UTILS -----------------------
 def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 def fmt_money(x: float) -> str:
@@ -71,21 +57,21 @@ def fmt_money(x: float) -> str:
 def fmt_pct(x: float) -> str:
     return f"{x:.2f}%"
 
-# ----------------------- market data -----------------------
-async def fetch_klines(pair: str, interval: str = TIMEFRAME, limit: int = 100) -> pd.DataFrame:
+# ----------------------- MARKET DATA -----------------------
+async def fetch_klines(pair: str, interval: str = TIMEFRAME, limit: int = 120) -> pd.DataFrame:
     params = {"symbol": pair, "interval": interval, "limit": limit}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(MEXC_KLINES, params=params)
         r.raise_for_status()
         data = r.json()
-    rows = [[row[0], row[1], row[2], row[3], row[4], row[5]] for row in data]  # take 6 first fields
+    rows = [[row[0], row[1], row[2], row[3], row[4], row[5]] for row in data]  # берем первые 6 полей
     df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna().reset_index(drop=True)
 
-# ----------------------- strategy #9 -----------------------
+# ----------------------- STRATEGY #9 -----------------------
 def ema(s: pd.Series, period: int) -> pd.Series:
     return s.ewm(span=period, adjust=False).mean()
 
@@ -119,7 +105,7 @@ def strategy9(df: pd.DataFrame) -> dict:
         return {"signal":"SHORT","reason":"patt+ema_down","ema_slope":slope,"patterns":patt}
     return {"signal":None,"reason":"no_setup","ema_slope":slope,"patterns":patt}
 
-# ----------------------- trading (demo) -----------------------
+# ----------------------- TRADING (DEMO) -----------------------
 async def open_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: float, side: str):
     st.pos_open, st.side, st.entry, st.qty = True, side, price, TRADE_SIZE
     if side=="LONG":
@@ -160,7 +146,7 @@ async def close_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: f
         parse_mode=constants.ParseMode.HTML
     )
 
-# ----------------------- per-pair loop via JobQueue -----------------------
+# ----------------------- PER-PAIR JOB -----------------------
 async def pair_job(ctx: ContextTypes.DEFAULT_TYPE):
     pair = ctx.job.data["pair"]
     st = STATES[pair]
@@ -198,7 +184,7 @@ async def pair_job(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception(e)
 
-# ----------------------- commands -----------------------
+# ----------------------- COMMANDS -----------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         f"✅ mybot9 running ({'DEMO' if DEMO_MODE else 'LIVE'})\n"
@@ -220,7 +206,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"—\nTOTAL • trades: {GLOBAL['closed']}  WR: {fmt_pct(total_wr)}  PnL: {fmt_money(GLOBAL['pnl'])}")
     await update.message.reply_html("\n".join(lines))
 
-# ----------------------- build & run -----------------------
+# ----------------------- BUILD & RUN -----------------------
 def build_app() -> Application:
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -230,10 +216,9 @@ def build_app() -> Application:
     return app
 
 def main():
-    start_health_http_server()
     logger.info("🤖 mybot9 started successfully!")
     app = build_app()
-    # НИКАКОЙ ручной инициализации! Всё делает run_polling
+    # run_polling сам делает initialize/start/stop — никаких своих серверов не поднимаем
     app.run_polling(allowed_updates=constants.Update.ALL_TYPES)
 
 if __name__ == "__main__":
