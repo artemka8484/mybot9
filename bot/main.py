@@ -1,5 +1,5 @@
 # bot/main.py
-import os, hmac, hashlib, asyncio, json
+import os, hmac, hashlib, asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, List, Optional
 
@@ -21,14 +21,14 @@ START_BALANCE = float(os.getenv("START_BALANCE_USDT", "1000"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
 
 # risk management
-TP_PCT = float(os.getenv("TP_PCT", "0.006"))          # 0.6% по умолчанию
-SL_PCT = float(os.getenv("SL_PCT", "0.004"))          # 0.4%
+TP_PCT = float(os.getenv("TP_PCT", "0.006"))          # 0.6% TP
+SL_PCT = float(os.getenv("SL_PCT", "0.004"))          # 0.4% SL
 TRAILING = os.getenv("TRAILING", "0").lower() in ("1","true","yes")
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.003"))    # 0.3%
+TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.003"))    # 0.3% trailing
 
 # daily summary
 DAILY_SUMMARY = os.getenv("DAILY_SUMMARY", "1").lower() in ("1","true","yes")
-SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "21"))   # UTC час отправки сводки
+SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "21"))   # UTC
 
 # MEXC keys (для REAL режима)
 MEXC_KEY = os.getenv("MEXC_API_KEY", "")
@@ -70,7 +70,7 @@ async def fetch_klines(pair: str, limit: int = 600) -> pd.DataFrame:
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df.dropna().reset_index(index=False)
+    return df.dropna().reset_index(drop=True)
 
 # ===================== STRATEGY #9 =====================
 def ema(series: pd.Series, period: int) -> pd.Series:
@@ -149,10 +149,9 @@ class Portfolio:
         p = self.pos.get(pair)
         if not p or not p.get("trailing"):
             return
-        if p["side"] == "BUY":
-            if last > p["trail_anchor"]:
-                p["trail_anchor"] = last
-                p["sl"] = p["trail_anchor"]*(1 - p["trail_pct"])
+        if p["side"] == "BUY" and last > p["trail_anchor"]:
+            p["trail_anchor"] = last
+            p["sl"] = p["trail_anchor"]*(1 - p["trail_pct"])
 
     def close(self, pair: str, price: float, reason_close: str) -> Dict[str, Any]:
         p = self.pos.pop(pair)
@@ -207,9 +206,13 @@ async def report_close(result: Dict[str, Any], pattern_exit: Optional[str]):
     Сообщение о закрытии сделки:
     — PnL, баланс
     — количество сделок за сегодня (после закрытия)
+    — win-rate (успешные сделки)
     """
     mode = "DEMO" if DEMO_MODE else "REAL"
-    deals_today = len(portfolio.closed)  # после portfolio.close() уже добавлено
+    deals_today = len(portfolio.closed)  # после close уже добавлено
+    wins = sum(1 for t in portfolio.closed if t["pnl"] > 0)
+    winrate = (wins / deals_today * 100) if deals_today else 0.0
+
     msg = (
         f"🟥 CLOSE {result['side']}\n"
         f"• Pair: {result['pair']}  TF: {TIMEFRAME}\n"
@@ -221,7 +224,7 @@ async def report_close(result: Dict[str, Any], pattern_exit: Optional[str]):
         f"• Reason: {result['reason_close']}\n"
         f"• PnL: {'+' if result['pnl']>=0 else ''}{result['pnl']:.4f} USDT\n"
         f"• 💰 Balance ({mode}): {result['balance']:.2f} USDT\n"
-        f"• 📈 Deals today: {deals_today}"
+        f"• 📈 Deals today: {deals_today} | Win-rate: {winrate:.1f}%"
     )
     await send(msg)
 
