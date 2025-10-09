@@ -1,7 +1,7 @@
 # bot/main.py
 import os
-import fcntl  # для single-instance lock
 import asyncio
+import fcntl
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Any, List, Tuple
@@ -13,24 +13,31 @@ from loguru import logger
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 
 # ================== ENV ==================
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
+# режимы приема апдейтов
+USE_WEBHOOK = os.getenv("USE_WEBHOOK", "false").lower() in ("1", "true", "yes")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()        # напр. https://mybot9.koyeb.app/tg
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/tg").strip()   # путь на нашем сервере
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mybot9-secret")  # необязательный secret
+
+# прочее
 PAIRS = [p.strip().upper() for p in os.getenv(
     "PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 ).split(",") if p.strip()]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")         # 1m/5m/15m...
-LIMIT = int(os.getenv("KL_LIMIT", "300"))        # свечей для расчётов
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")
+LIMIT = int(os.getenv("KL_LIMIT", "300"))
 
-# Демо-торговля с фьючерсной моделью
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
-LEVERAGE = min(5.0, float(os.getenv("LEVERAGE", "3")))      # максимум 5х
-FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))             # 0.06% за сторону
-RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))             # риск на сделку от эквити, 1%
+LEVERAGE = min(5.0, float(os.getenv("LEVERAGE", "5")))  # максимум 5х
+FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))
+RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))
 
 ATR_LEN = int(os.getenv("ATR_LEN", "14"))
 ATR_MULT_TP = float(os.getenv("ATR_MULT_TP", "1.5"))
@@ -44,15 +51,17 @@ MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "40"))
 
 DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0").lower() in ("1", "true", "yes")
 
+PORT = int(os.getenv("PORT", "8080"))
+
 # ================== STATE ==================
 state: Dict[str, Any] = {
     "equity": START_BALANCE,
     "high_water": START_BALANCE,
     "pairs": {
         p: {
-            "pos": None,                 # открытая позиция или None
-            "last_entry_ts": 0.0,        # время последнего входа (UTC ts)
-            "day": None,                 # контроль суточных лимитов
+            "pos": None,
+            "last_entry_ts": 0.0,
+            "day": None,
             "trades_today": 0,
             "stats": {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0},
         } for p in PAIRS
@@ -61,13 +70,13 @@ state: Dict[str, Any] = {
 
 # ================== UTILS ==================
 def ensure_single_instance(lock_path: str = "/tmp/mybot9.lock"):
-    """Не допускаем одновременный запуск двух экземпляров (409 в Telegram)."""
+    """Запрещаем второй экземпляр в том же контейнере."""
     fd = open(lock_path, "w")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fd.write(str(os.getpid()))
         fd.flush()
-        return fd  # держим открытым, иначе лок снимется GC
+        return fd
     except BlockingIOError:
         logger.error("Another bot instance is already running. Exiting.")
         raise SystemExit(0)
@@ -90,37 +99,33 @@ async def tg_send(app: Application, text: str):
         logger.error(f"TG send error: {e}")
 
 def start_health_http_server():
-    """Поднимаем health-сервер; если порт занят — не валимся, пробуем другой/пропускаем."""
-    ports_to_try = [int(os.getenv("PORT", "8080")), 8081]
-
+    """Health-сервер только в режиме polling.
+    Если порт занят — пробуем 8081/пропускаем, без падения."""
+    ports_to_try = [PORT, 8081]
     class Quiet(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args) -> None:  # приглушаем логи
+        def log_message(self, format: str, *args) -> None:
             pass
         def do_GET(self):
             self.send_response(200 if self.path == "/" else 404)
             self.end_headers()
             if self.path == "/":
                 self.wfile.write(b"OK")
-
-    for port in ports_to_try:
+    for p in ports_to_try:
         try:
-            httpd = HTTPServer(("0.0.0.0", port), Quiet)
+            httpd = HTTPServer(("0.0.0.0", p), Quiet)
             loop = asyncio.get_running_loop()
             loop.create_task(asyncio.to_thread(httpd.serve_forever))
-            logger.info(f"Health server on :{port}")
+            logger.info(f"Health server on :{p}")
             return
         except OSError as e:
-            logger.warning(f"Health server bind failed on :{port} ({e}); try next/skip")
+            logger.warning(f"Health server bind failed on :{p} ({e}); try next/skip")
 
 # ================== DATA (MEXC) ==================
 MEXC_BASE = "https://api.mexc.com"
 TF_MAP = {"1m": "1m", "5m": "5m", "15m": "15m"}
 
 async def fetch_klines(pair: str) -> pd.DataFrame:
-    """
-    Резильентный парсер klines MEXC: иногда возвращают 8 полей, иногда 12.
-    Берём первые 6: [openTime, open, high, low, close, volume].
-    """
+    """Парсер klines, устойчивый к 8/12 полям: берем первые 6 (t, o, h, l, c, v)."""
     tf = TF_MAP.get(TIMEFRAME, "1m")
     url = f"{MEXC_BASE}/api/v3/klines"
     params = {"symbol": pair, "interval": tf, "limit": LIMIT}
@@ -135,7 +140,6 @@ async def fetch_klines(pair: str) -> pd.DataFrame:
             rows.append([k[0], k[1], k[2], k[3], k[4], k[5]])
 
     df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "vol"])
-    # типы
     for c in ["open", "high", "low", "close", "vol"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
@@ -156,11 +160,9 @@ def patterns(df: pd.DataFrame) -> Dict[str, bool]:
     o, h, l, c = df["open"].iloc[-1], df["high"].iloc[-1], df["low"].iloc[-1], df["close"].iloc[-1]
     o1, c1 = df["open"].iloc[-2], df["close"].iloc[-2]
 
-    # engulfing
     bull_engulf = (c > o) and (c1 < o1) and (c >= o1) and (o <= c1)
     bear_engulf = (c < o) and (c1 > o1) and (c <= o1) and (o >= c1)
 
-    # hammer & shooting-star
     body = abs(c - o)
     rng = max(h - l, 1e-9)
     lower_tail = (min(c, o) - l) / rng
@@ -168,7 +170,6 @@ def patterns(df: pd.DataFrame) -> Dict[str, bool]:
     hammer = (lower_tail >= 0.55) and (body / rng <= 0.2)
     shooting = (upper_tail >= 0.55) and (body / rng <= 0.2)
 
-    # breakout последних 20 свечей
     win = df["close"].iloc[-20:]
     breakout_up = c >= win.max()
     breakout_dn = c <= win.min()
@@ -196,7 +197,6 @@ def position_size_from_risk(entry: float, sl: float, equity: float) -> float:
     return max(0.0, qty)
 
 def fees_cost(notional: float) -> float:
-    # комиссия на вход и выход (taker)
     return notional * FEE_PCT
 
 def simulate_close(side: str, entry: float, exit_: float, qty: float) -> float:
@@ -253,7 +253,6 @@ async def pair_loop(app: Application, pair: str):
                     pnl = simulate_close(side, entry, last, qty)
                     pr["pos"] = None
 
-                    # stats
                     st = pr["stats"]
                     st["trades"] += 1
                     st["pnl"] += pnl
@@ -316,7 +315,6 @@ async def pair_loop(app: Application, pair: str):
                         )
                         await tg_send(app, txt)
 
-            # отладка по запросу
             if DEBUG_TELEMETRY:
                 pr_open = pr["pos"]
                 patt_name = ", ".join([k for k, v in patterns(df).items() if v]) or "—"
@@ -357,34 +355,69 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
 
     async def post_init(a: Application):
-        # Сбрасываем вебхук, чтобы не конфликтовать с polling
+        # Сбрасываем вебхук в любом случае (перед polling/перед новой установкой webhook)
         try:
             await a.bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
             logger.warning(f"delete_webhook warning: {e}")
 
-        # Запуск фоновых лупов по всем парам
+        # фоновая торговля
         for p in PAIRS:
             asyncio.create_task(pair_loop(app, p))
         logger.info("Background loops started")
+
+        # Если выбран webhook-режим — выставим хук
+        if USE_WEBHOOK and WEBHOOK_URL:
+            try:
+                await a.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    secret_token=WEBHOOK_SECRET,
+                    drop_pending_updates=True,
+                    allowed_updates=None
+                )
+                logger.info(f"Webhook set: {WEBHOOK_URL}")
+            except Exception as e:
+                logger.error(f"set_webhook error: {e}")
 
     app.post_init = post_init  # type: ignore
     return app
 
 def main():
     logger.info("🤖 mybot9 started successfully!")
-
-    # Health server (не валим процесс, если порт занят)
-    try:
-        start_health_http_server()
-    except Exception as e:
-        logger.warning(f"Health server init skipped: {e}")
-
-    # Единственный экземпляр
-    _lock_fd = ensure_single_instance()  # держим ссылку, чтобы лок не снялся
+    _lock_fd = ensure_single_instance()
 
     app = build_app()
-    app.run_polling()
+
+    if USE_WEBHOOK and WEBHOOK_URL:
+        # В webhook-режиме НЕ запускаем отдельный health-сервер, run_webhook сам слушает порт
+        listen_port = PORT
+        listen_addr = "0.0.0.0"
+        try:
+            app.run_webhook(
+                listen=listen_addr,
+                port=listen_port,
+                url_path=WEBHOOK_PATH,  # путь для приема апдейтов
+                drop_pending_updates=True,
+                stop_signals=None,  # управляем завершением контейнером
+            )
+        except Exception as e:
+            logger.exception(f"run_webhook failed: {e}")
+            raise SystemExit(1)
+    else:
+        # polling-режим + health-сервер
+        try:
+            start_health_http_server()
+        except Exception as e:
+            logger.warning(f"Health server init skipped: {e}")
+
+        try:
+            app.run_polling(drop_pending_updates=True, stop_signals=None)
+        except Conflict as e:
+            logger.error(f"Polling Conflict 409: {e}. Another instance is polling. Exiting gracefully.")
+            raise SystemExit(0)
+        except Exception as e:
+            logger.exception(f"run_polling failed: {e}")
+            raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
