@@ -7,3 +7,4 @@ redis==5.0.7
 loguru==0.7.3
 python-dateutil==2.9.0.post0
 loguru
+python-telegram-bot==21.6
