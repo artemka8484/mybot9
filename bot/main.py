@@ -1,6 +1,6 @@
 # bot/main.py
 import os, hmac, hashlib, asyncio, json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, List, Optional
 
 import numpy as np
@@ -17,19 +17,18 @@ TIMEFRAME = os.getenv("TIMEFRAME", "1m")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0") or "0")
-TX = os.getenv("TX", "UTC")
 START_BALANCE = float(os.getenv("START_BALANCE_USDT", "1000"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
 
 # risk management
-TP_PCT = float(os.getenv("TP_PCT", "0.005"))          # 0.5% по умолчанию
+TP_PCT = float(os.getenv("TP_PCT", "0.006"))          # 0.6% по умолчанию
 SL_PCT = float(os.getenv("SL_PCT", "0.004"))          # 0.4%
 TRAILING = os.getenv("TRAILING", "0").lower() in ("1","true","yes")
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.003"))    # 0.3%
 
 # daily summary
 DAILY_SUMMARY = os.getenv("DAILY_SUMMARY", "1").lower() in ("1","true","yes")
-SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "21"))   # час отправки по UTC
+SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "21"))   # UTC час отправки сводки
 
 # MEXC keys (для REAL режима)
 MEXC_KEY = os.getenv("MEXC_API_KEY", "")
@@ -71,7 +70,7 @@ async def fetch_klines(pair: str, limit: int = 600) -> pd.DataFrame:
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df.dropna().reset_index(drop=True)
+    return df.dropna().reset_index(index=False)
 
 # ===================== STRATEGY #9 =====================
 def ema(series: pd.Series, period: int) -> pd.Series:
@@ -94,9 +93,12 @@ def detect_patterns(df: pd.DataFrame) -> Dict[str, bool]:
     lo = min(c[i0], o[i0])-l[i0]
     hammer = (lo > body*2) and (up < body)
     shooting = (up > body*2) and (lo < body)
-    return {k: bool(v) for k,v in {
-        "bull_engulf": bull, "bear_engulf": bear, "hammer": hammer, "shooting": shooting
-    }.items()}
+    return {
+        "bull_engulf": bool(bull),
+        "bear_engulf": bool(bear),
+        "hammer": bool(hammer),
+        "shooting": bool(shooting)
+    }
 
 def strategy9_signal(df: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
     if len(df) < 60:
@@ -120,14 +122,14 @@ class Portfolio:
     def __init__(self, start_balance: float):
         self.balance = start_balance  # USDT
         self.pos: Dict[str, Dict[str, Any]] = {}  # pair -> state
-        self.closed: List[Dict[str, Any]] = []    # сделки за день
+        self.closed: List[Dict[str, Any]] = []    # сделки за сегодня
 
     def is_open(self, pair: str) -> bool:
         return pair in self.pos
 
     def open(self, pair: str, side: str, price: float, qty: float, reason: str,
              tp_pct: float, sl_pct: float, trailing: bool, trail_pct: float):
-        # Только BUY для упрощения (лонг). SELL сигнал закрывает лонг/не открывает шорт.
+        # Открываем только BUY (лонг). SELL сигнал закрывает лонг.
         state = {
             "side": side,
             "qty": qty,
@@ -145,11 +147,12 @@ class Portfolio:
 
     def update_trailing(self, pair: str, last: float):
         p = self.pos.get(pair)
-        if not p or not p.get("trailing"): return
+        if not p or not p.get("trailing"):
+            return
         if p["side"] == "BUY":
             if last > p["trail_anchor"]:
                 p["trail_anchor"] = last
-                p["sl"] = p["trail_anchor"]*(1 - p["trail_pct"])  # подтягиваем стоп
+                p["sl"] = p["trail_anchor"]*(1 - p["trail_pct"])
 
     def close(self, pair: str, price: float, reason_close: str) -> Dict[str, Any]:
         p = self.pos.pop(pair)
@@ -200,6 +203,13 @@ async def report_open(pair: str, side: str, qty: float, price: float, pattern: O
     await send(msg)
 
 async def report_close(result: Dict[str, Any], pattern_exit: Optional[str]):
+    """
+    Сообщение о закрытии сделки:
+    — PnL, баланс
+    — количество сделок за сегодня (после закрытия)
+    """
+    mode = "DEMO" if DEMO_MODE else "REAL"
+    deals_today = len(portfolio.closed)  # после portfolio.close() уже добавлено
     msg = (
         f"🟥 CLOSE {result['side']}\n"
         f"• Pair: {result['pair']}  TF: {TIMEFRAME}\n"
@@ -210,17 +220,18 @@ async def report_close(result: Dict[str, Any], pattern_exit: Optional[str]):
         f"• Exit pattern: {pattern_exit or '—'}\n"
         f"• Reason: {result['reason_close']}\n"
         f"• PnL: {'+' if result['pnl']>=0 else ''}{result['pnl']:.4f} USDT\n"
-        f"• Balance (DEMO): {result['balance']:.2f} USDT"
+        f"• 💰 Balance ({mode}): {result['balance']:.2f} USDT\n"
+        f"• 📈 Deals today: {deals_today}"
     )
     await send(msg)
 
 async def send_daily_summary():
     if not portfolio.closed:
-        await send("📊 Daily summary: сделок не было.")
+        await send(f"📊 Daily summary ({datetime.utcnow().date()} UTC): сделок не было.")
         return
     total = sum(t["pnl"] for t in portfolio.closed)
-    wins = sum(1 for t in portfolio.closed if t["pnl"]>0)
-    losses = len(portfolio.closed)-wins
+    wins = sum(1 for t in portfolio.closed if t["pnl"] > 0)
+    losses = len(portfolio.closed) - wins
     by_pair: Dict[str, float] = {}
     for t in portfolio.closed:
         by_pair[t["pair"]] = by_pair.get(t["pair"], 0.0) + t["pnl"]
@@ -228,11 +239,11 @@ async def send_daily_summary():
     lines.append(f"• Deals: {len(portfolio.closed)} | Win: {wins} | Loss: {losses}")
     lines.append(f"• PnL total: {'+' if total>=0 else ''}{total:.4f} USDT")
     lines.append("• By pair:")
-    for k,v in by_pair.items():
+    for k, v in by_pair.items():
         lines.append(f"  - {k}: {'+' if v>=0 else ''}{v:.4f}")
     lines.append(f"• Balance (DEMO): {portfolio.balance:.2f} USDT")
     await send("\n".join(lines))
-    # очистим список сделок на новый день
+    # очищаем список сделок на новый день
     portfolio.closed.clear()
 
 # ===================== PAIR WORKER =====================
@@ -254,16 +265,13 @@ async def run_pair(pair: str):
                 if st["side"] == "BUY":
                     if last >= st["tp"]:
                         res = portfolio.close(pair, last, "Take Profit")
-                        await report_close(res, detect_patterns(df) and
-                                           ( "bullish_cont" if last>=st["tp"] else None))
+                        await report_close(res, "tp_hit")
                     elif last <= st["sl"]:
                         res = portfolio.close(pair, last, "Stop Loss")
-                        await report_close(res, detect_patterns(df) and
-                                           ( "bearish_break" if last<=st["sl"] else None))
+                        await report_close(res, "sl_hit")
 
             # торговые сигналы
             if signal == "BUY" and not portfolio.is_open(pair):
-                # DEMO/REAL open
                 if DEMO_MODE:
                     portfolio.open(pair, "BUY", last, TRADE_SIZE, info["reason"],
                                    TP_PCT, SL_PCT, TRAILING, TRAIL_PCT)
@@ -275,21 +283,21 @@ async def run_pair(pair: str):
                     except Exception as e:
                         logger.error(f"REAL BUY failed {pair}: {e}")
                         await send(f"⚠️ REAL BUY failed {pair}: {e}")
+                        await asyncio.sleep(10); continue
                 await report_open(pair, "BUY", TRADE_SIZE, last, info.get("pattern"), info["reason"])
 
             elif signal == "SELL" and portfolio.is_open(pair):
                 if DEMO_MODE:
                     res = portfolio.close(pair, last, "Opposite signal")
+                    await report_close(res, info.get("pattern"))
                 else:
                     try:
                         await mexc_order_market(pair, "SELL", TRADE_SIZE)
                         res = portfolio.close(pair, last, "Opposite signal")
+                        await report_close(res, info.get("pattern"))
                     except Exception as e:
                         logger.error(f"REAL SELL failed {pair}: {e}")
                         await send(f"⚠️ REAL SELL failed {pair}: {e}")
-                        res = None
-                if res:
-                    await report_close(res, info.get("pattern"))
 
         except Exception as e:
             logger.exception(e)
@@ -298,9 +306,9 @@ async def run_pair(pair: str):
 # ===================== DAILY SUMMARY SCHEDULER =====================
 async def summary_scheduler():
     """
-    Каждую минуту проверяем — если наступил SUMMARY_HOUR (UTC) и ещё не отправляли сегодня — шлём.
+    Раз в минуту проверяем — если наступил SUMMARY_HOUR (UTC) и за сегодня сводка не отправлялась — шлём.
     """
-    if not DAILY_SUMMARY:  # можно полностью отключить
+    if not DAILY_SUMMARY:
         return
     sent_for_day: Optional[datetime.date] = None
     while True:
