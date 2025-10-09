@@ -2,8 +2,7 @@
 import os
 import asyncio
 import json
-import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Any, List, Tuple
 
@@ -15,14 +14,14 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# -------------------- ENV --------------------
+# ============== ENV ==============
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 PAIRS = [p.strip().upper() for p in os.getenv(
     "PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 ).split(",") if p.strip()]
 
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")  # 1m/5m/15m ...
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")  # 1m/5m/15m
 LIMIT = int(os.getenv("KL_LIMIT", "300"))
 
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
@@ -43,7 +42,7 @@ MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "40"))
 
 DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0") in ("1", "true", "yes")
 
-# -------------------- STATE --------------------
+# ============== STATE ==============
 state: Dict[str, Any] = {
     "equity": START_BALANCE,
     "high_water": START_BALANCE,
@@ -58,7 +57,7 @@ state: Dict[str, Any] = {
     }
 }
 
-# -------------------- UTILS --------------------
+# ============== UTILS ==============
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -77,10 +76,11 @@ async def tg_send(app: Application, text: str):
         logger.error(f"TG send error: {e}")
 
 def start_health_http_server():
-    """Пытаемся поднять health-сервер; если порт занят — не падаем."""
+    """Поднимаем health-сервер; если порт занят — не валимся."""
     ports_to_try = [int(os.getenv("PORT", "8080")), 8081]
+
     class Quiet(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args) -> None:  # mute
+        def log_message(self, format: str, *args) -> None:
             pass
         def do_GET(self):
             self.send_response(200 if self.path == "/" else 404)
@@ -96,23 +96,34 @@ def start_health_http_server():
             logger.info(f"Health server on :{port}")
             return
         except OSError as e:
-            logger.warning(f"Health server bind failed on :{port} ({e}), will try another/skip")
-    # если оба порта заняты — просто продолжаем без health-сервера
+            logger.warning(f"Health server bind failed on :{port} ({e}); try next/skip")
 
-# -------------------- DATA --------------------
+# ============== DATA ==============
 MEXC_BASE = "https://api.mexc.com"
 TF_MAP = {"1m": "1m", "5m": "5m", "15m": "15m"}
 
 async def fetch_klines(pair: str) -> pd.DataFrame:
+    """Резильентный парсер klines: поддерживает ответы длиной 8 или 12."""
     tf = TF_MAP.get(TIMEFRAME, "1m")
     url = f"{MEXC_BASE}/api/v3/klines"
     params = {"symbol": pair, "interval": tf, "limit": LIMIT}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
-        data = r.json()
-    cols = ["t", "open", "high", "low", "close", "vol", "_1", "_2", "_3", "_4", "_5", "_6"]
-    df = pd.DataFrame(data, columns=cols)[["t", "open", "high", "low", "close", "vol"]]
+        raw = r.json()
+
+    # Берём только первые 6 столбцов из каждой свечи
+    rows: List[List[Any]] = []
+    for k in raw:
+        # ожидаем минимум 6 значений: [time, open, high, low, close, volume, ...]
+        if isinstance(k, list) and len(k) >= 6:
+            rows.append([k[0], k[1], k[2], k[3], k[4], k[5]])
+        else:
+            # пропускаем странные элементы
+            continue
+
+    df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "vol"])
+    # типы
     for c in ["open", "high", "low", "close", "vol"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
@@ -134,7 +145,7 @@ def patterns(df: pd.DataFrame) -> Dict[str, bool]:
     o1, c1 = df["open"].iloc[-2], df["close"].iloc[-2]
     bull_engulf = (c > o) and (c1 < o1) and (c >= o1) and (o <= c1)
     bear_engulf = (c < o) and (c1 > o1) and (c <= o1) and (o >= c1)
-    body = abs(c - o); rng = h - l if (h - l) > 0 else 1e-9
+    body = abs(c - o); rng = max(h - l, 1e-9)
     lower_tail = (min(c, o) - l) / rng; upper_tail = (h - max(c, o)) / rng
     hammer = (lower_tail >= 0.55) and (body / rng <= 0.2)
     shooting = (upper_tail >= 0.55) and (body / rng <= 0.2)
@@ -153,7 +164,7 @@ def ema_slope(df: pd.DataFrame, length=EMA_LEN, bars=EMA_SLOPE_BARS) -> float:
     e = ema(df["close"], length)
     return float(e.iloc[-1] - e.iloc[-bars])
 
-# -------------------- TRADING MODEL --------------------
+# ============== TRADING ==============
 def position_size_from_risk(entry: float, sl: float, equity: float) -> float:
     risk_usd = equity * RISK_PCT
     sl_dist = abs(entry - sl)
@@ -171,7 +182,6 @@ def simulate_close(side: str, entry: float, exit_: float, qty: float) -> float:
     fee = fees_cost(entry * qty) + fees_cost(exit_ * qty)
     return gross - fee
 
-# -------------------- SIGNAL --------------------
 def decide(df: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
     patt = patterns(df)
     slope = ema_slope(df, EMA_LEN, EMA_SLOPE_BARS)
@@ -183,12 +193,15 @@ def decide(df: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
         "patt": patt, "slope": slope, "atr": atr_val, "last": last
     }
 
-# -------------------- LOOP PER PAIR --------------------
+# ============== LOOP ==============
 async def pair_loop(app: Application, pair: str):
     logger.info(f"Loop started for {pair}")
     while True:
         try:
             df = await fetch_klines(pair)
+            if len(df) < max(EMA_LEN, ATR_LEN, EMA_SLOPE_BARS) + 2:
+                await asyncio.sleep(5); continue
+
             sig, info = decide(df)
             pr = state["pairs"][pair]
             now = datetime.now(timezone.utc)
@@ -200,6 +213,7 @@ async def pair_loop(app: Application, pair: str):
             last = info["last"]
             atr_val = max(1e-9, info["atr"])
 
+            # --- manage open position
             if pr["pos"]:
                 pos = pr["pos"]
                 side = pos["side"]; entry = pos["entry"]
@@ -231,6 +245,7 @@ async def pair_loop(app: Application, pair: str):
                     )
                     await tg_send(app, txt)
 
+            # --- open new
             can_open = (sig != "FLAT") and (pr["pos"] is None)
             if can_open:
                 if pr["trades_today"] < MAX_TRADES_PER_DAY and \
@@ -242,7 +257,7 @@ async def pair_loop(app: Application, pair: str):
                     qty = position_size_from_risk(entry, sl, state["equity"])
                     if qty > 0:
                         pr["pos"] = {"side": side, "entry": entry, "sl": sl, "tp": tp,
-                                    "qty": qty, "ts": datetime.now(timezone.utc).timestamp()}
+                                     "qty": qty, "ts": datetime.now(timezone.utc).timestamp()}
                         pr["trades_today"] += 1
                         pr["last_entry_ts"] = datetime.now(timezone.utc).timestamp()
                         patt_name = ", ".join([k for k, v in info["patt"].items() if v]) or "—"
@@ -272,7 +287,7 @@ async def pair_loop(app: Application, pair: str):
 
         await asyncio.sleep(5 if TIMEFRAME == '1m' else 15)
 
-# -------------------- COMMANDS --------------------
+# ============== COMMANDS ==============
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tot_tr = tot_w = 0
     tot_pnl = 0.0
@@ -291,7 +306,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"equity: {fmt(state['equity'],5)}  leverage: {LEVERAGE}×  fee: {FEE_PCT*100:.3f}%")
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
-# -------------------- APP --------------------
+# ============== APP ==============
 def build_app() -> Application:
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("status", cmd_status))
