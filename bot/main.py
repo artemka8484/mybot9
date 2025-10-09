@@ -1,486 +1,443 @@
 # bot/main.py
-import os
-import time
-import math
-import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, Tuple, List
+# -*- coding: utf-8 -*-
+"""
+mybot9 — простая демо-стратегия (тест #9):
+- Пары из ENV (по-умолчанию BTCUSDT, ETHUSDT)
+- Таймфрейм: из ENV (по-умолчанию 5m)
+- TP фиксированный в процентах (TP_PCT, напр. 0.0035 = 0.35%)
+- SL = ATR * ATR_MULT_SL
+- Вход по 6 паттернам + фильтр тренда EMA100 slope (EMA_SLOPE_BARS)
+- Жёсткий «trend guard»: LONG разрешён только при slope>0, SHORT — только при slope<0
+- Риск от баланса (RISK_PCT), плечо (LEVERAGE), демо-режим с учётом комиссии FEE_PCT
+- Кулдаун COOLDOWN_SEC между сделками по инструменту
+- Телеграм: /start, /status
+"""
+
+import os, time, threading, math, json, traceback
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List, Tuple
 
 import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from telegram import ParseMode
 from telegram.ext import Updater, CommandHandler
 
-# =========================
-# -------- CONFIG ---------
-# =========================
+# ---------- ENV ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0") or "0")
 
-ENV = os.getenv
+PAIRS = [s.strip().upper() for s in os.getenv("PAIRS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
+TIMEFRAME = os.getenv("TIMEFRAME", "5m").lower()  # 1m/3m/5m/15m/1h...
+TICK_SEC = int(os.getenv("TICK_SEC", "10"))       # частота цикла
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "240"))
 
-TELEGRAM_TOKEN = ENV("TELEGRAM_TOKEN", "")
-CHAT_ID = int(ENV("TELEGRAM_CHAT_ID", "0") or "0")
+EMA_LEN = int(os.getenv("EMA_LEN", "100"))
+EMA_SLOPE_BARS = int(os.getenv("EMA_SLOPE_BARS", "8"))
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1"))   # SL = ATR*mult
 
-MODE = ENV("MODE", "DEMO").upper()          # DEMO / LIVE (но трейды всё равно dry-run без реальных ордеров)
-DEMO_MODE = ENV("DEMO_MODE", "true").lower() == "true"
-DEMO_START_BALANCE = float(ENV("DEMO_START_BALANCE", "5000"))
+TP_PCT = float(os.getenv("TP_PCT", "0.0035"))        # 0.35% по-умолчанию
+RISK_PCT = float(os.getenv("RISK_PCT", "1"))         # % риска от equity на сделку
+LEVERAGE = float(os.getenv("LEVERAGE", "5"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))      # 0.06% (2 стороны ~0.12%)
 
-PAIRS = [s.strip() for s in ENV("PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT").split(",") if s.strip()]
+MODE = os.getenv("MODE", "DEMO").upper()
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+DEMO_START_BALANCE = float(os.getenv("DEMO_START_BALANCE", "5000"))
 
-TIMEFRAME = ENV("TIMEFRAME", "5m").lower()  # "1m"|"5m"|"15m"
-TICK_SECONDS = int(ENV("COOLDOWN_SEC", "60"))
+DAILY_SUMMARY = os.getenv("DAILY_SUMMARY", "1") == "1"
 
-EMA_LEN = int(ENV("EMA_LEN", "48"))
-EMA_SLOPE_BARS = int(ENV("EMA_SLOPE_BARS", "5"))
-ATR_LEN = int(ENV("ATR_LEN", "14"))
-ATR_MULT_SL = float(ENV("ATR_MULT_SL", "0.5"))
+BINANCE_BASE = "https://api.binance.com"  # публичные свечи берём у Binance
 
-TP_PCT = float(ENV("TP_PCT", "1"))           # ВНИМАНИЕ: это % (а не доля). 1 = 1%
-RISK_PCT = float(ENV("RISK_PCT", "3.0"))     # % риска на сделку от equity
-LEVERAGE = float(ENV("LEVERAGE", "5"))
-FEE_PCT = float(ENV("FEE_PCT", "0.0006"))    # комиссия за одну сторону (0.06%)
-
-DAILY_SUMMARY = ENV("DAILY_SUMMARY", "1") == "1"
-
-TX = ENV("TX", "UTC").upper()
-TZ = timezone.utc if TX == "UTC" else timezone(timedelta(hours=0))  # оставим UTC
-
-MEXC_BASE_URL = ENV("MEXC_BASE_URL", "https://contract.mexc.com").rstrip("/")
-
-# ---- вспомогательные маппинги таймфреймов ----
-BINANCE_TF = {"1m": "1m", "5m": "5m", "15m": "15m"}
-MEXC_TF = {"1m": "Min1", "5m": "Min5", "15m": "Min15"}
-
-# =========================
-# -------- STATE ----------
-# =========================
-state: Dict = {
+# ---------- Глобальное состояние ----------
+state_lock = threading.Lock()
+state: Dict[str, Any] = {
     "equity": DEMO_START_BALANCE,
     "start_equity": DEMO_START_BALANCE,
-    "open_positions": {},               # pair -> dict(position)
-    "stats": {},                        # pair -> {"wins": int, "losses": int, "pnl": float, "trades": int}
-    "total": {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0},
-    "day_anchor": datetime.now(timezone.utc).date()
+    "pairs": {},
+    "day_anchor": datetime.now(timezone.utc).date(),
 }
 for p in PAIRS:
-    state["stats"][p] = {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0}
-
-# =========================
-# ---- TELEGRAM HELPERS ---
-# =========================
-
-def tg_send(text: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    except Exception:
-        pass
-
-
-# =========================
-# ------- UTILITIES -------
-# =========================
-
-def pct(a: float) -> str:
-    return f"{a*100:.2f}%"
-
-def now_utc_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def safe_get(url: str, params=None, headers=None, timeout=15) -> Tuple[Optional[dict], Optional[str]]:
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-        try:
-            return r.json(), None
-        except Exception as e:
-            return None, f"json error: {e}"
-    except Exception as e:
-        return None, str(e)
-
-# =========================
-# ------ DATA FEEDS -------
-# =========================
-
-def klines_binance(symbol: str, tf: str, limit=200) -> Optional[pd.DataFrame]:
-    if tf not in BINANCE_TF:
-        return None
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": BINANCE_TF[tf], "limit": min(limit, 1000)}
-    js, err = safe_get(url, params=params)
-    if not js or not isinstance(js, list):
-        return None
-    rows = []
-    for it in js:
-        # [ openTime, open, high, low, close, volume, closeTime, ... ]
-        rows.append([int(it[0]), float(it[1]), float(it[2]), float(it[3]), float(it[4]), float(it[5])])
-    df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "vol"]).sort_values("t")
-    return df
-
-
-def get_klines(symbol: str, tf: str, limit=200) -> Optional[pd.DataFrame]:
-    """
-    Исправленный MEXC эндпоинт + корректный fallback на Binance.
-    """
-    df = None
-    # --- MEXC ---
-    if tf in MEXC_TF:
-        sym_mexc = symbol.replace("USDT", "_USDT")
-        url = f"{MEXC_BASE_URL}/api/v1/contract/kline"
-        params = {"symbol": sym_mexc, "interval": MEXC_TF[tf], "limit": min(limit, 200)}
-        js, err = safe_get(url, params=params)
-        if js and isinstance(js, dict) and js.get("success"):
-            data = js.get("data") or []
-            rows = []
-            for it in data:
-                # it = { "t":167xxx, "o":"", "h":"", "l":"", "c":"", "v":"" }
-                try:
-                    rows.append([int(it["t"]), float(it["o"]), float(it["h"]),
-                                 float(it["l"]), float(it["c"]), float(it["v"])])
-                except Exception:
-                    continue
-            if rows:
-                df = pd.DataFrame(rows, columns=["t", "open", "high", "low", "close", "vol"]).sort_values("t")
-
-    # --- Fallback Binance ---
-    if df is None or df.empty:
-        df = klines_binance(symbol, tf, limit)
-
-    return df
-
-# =========================
-# ---- INDICATORS/SIGNS ---
-# =========================
-
-def ema(arr: pd.Series, n: int) -> pd.Series:
-    return arr.ewm(span=n, adjust=False).mean()
-
-def atr(df: pd.DataFrame, n: int) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"].shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - close).abs(),
-        (low - close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
-
-def ema_slope(series: pd.Series, bars: int) -> float:
-    if len(series) < bars + 1:
-        return 0.0
-    x = np.arange(bars)
-    y = series.iloc[-bars:].values
-    # простой наклон
-    denom = (bars - 1)
-    if denom <= 0:
-        return 0.0
-    return (y[-1] - y[0]) / denom
-
-def detect_patterns(df: pd.DataFrame) -> Dict[str, bool]:
-    """
-    6 сигналов: bull_engulf, bear_engulf, hammer, shooting, breakout_up, breakout_dn
-    """
-    out = {k: False for k in ["bull_engulf", "bear_engulf", "hammer", "shooting", "breakout_up", "breakout_dn"]}
-    if len(df) < 3:
-        return out
-
-    o1, c1, h1, l1 = df.iloc[-2][["open", "close", "high", "low"]]
-    o2, c2, h2, l2 = df.iloc[-1][["open", "close", "high", "low"]]
-
-    body1 = abs(c1 - o1)
-    body2 = abs(c2 - o2)
-    rng2 = h2 - l2 + 1e-12
-
-    # engulfings
-    if (c1 < o1) and (c2 > o2) and (o2 < c1) and (c2 > o1):
-        out["bull_engulf"] = True
-    if (c1 > o1) and (c2 < o2) and (o2 > c1) and (c2 < o1):
-        out["bear_engulf"] = True
-
-    # hammer / shooting-star: хвост >= 2 * тело
-    lower = min(o2, c2) - l2
-    upper = h2 - max(o2, c2)
-    if lower >= 2 * body2 and body2 / rng2 < 0.6:
-        out["hammer"] = True
-    if upper >= 2 * body2 and body2 / rng2 < 0.6:
-        out["shooting"] = True
-
-    # breakout
-    hh = df["high"].iloc[-20:-1].max()
-    ll = df["low"].iloc[-20:-1].min()
-    if h2 > hh and c2 > o2:
-        out["breakout_up"] = True
-    if l2 < ll and c2 < o2:
-        out["breakout_dn"] = True
-
-    return out
-
-# =========================
-# ------- SIZING ----------
-# =========================
-
-def position_size(pair: str, price: float, equity: float, risk_pct: float) -> float:
-    """
-    Размер позиции (квота USDT) = equity * risk_pct * leverage
-    Возвращаем кол-во базовой валюты (qty).
-    """
-    capital = equity * (risk_pct / 100.0) * LEVERAGE
-    if capital <= 0:
-        return 0.0
-    qty = capital / max(price, 1e-9)
-    return qty
-
-# =========================
-# ------- TRADING ---------
-# =========================
-
-def open_signal(df: pd.DataFrame) -> Tuple[Optional[str], Dict[str, float], str]:
-    """
-    Возвращает ("LONG"/"SHORT"/None, targets, reason)
-    """
-    pats = detect_patterns(df)
-    close = df["close"].iloc[-1]
-    ema48 = ema(df["close"], EMA_LEN)
-    slope = ema_slope(ema48, EMA_SLOPE_BARS)
-    a = atr(df, ATR_LEN).iloc[-1]
-
-    # Приоритет: breakout > engulf > hammer/shooting
-    reason = []
-    if pats["breakout_up"]:
-        reason.append("breakout_up")
-        direction = "LONG"
-    elif pats["breakout_dn"]:
-        reason.append("breakout_dn")
-        direction = "SHORT"
-    elif pats["bull_engulf"] or pats["hammer"]:
-        reason.append("bull_engulf" if pats["bull_engulf"] else "hammer")
-        direction = "LONG"
-    elif pats["bear_engulf"] or pats["shooting"]:
-        reason.append("bear_engulf" if pats["bear_engulf"] else "shooting")
-        direction = "SHORT"
-    else:
-        return None, {}, ""
-
-    # ТП/SL: TP_PCT (%) относительно цены, SL по ATR
-    tp = close * (1.0 + (TP_PCT / 100.0)) if direction == "LONG" else close * (1.0 - (TP_PCT / 100.0))
-    sl = (close - ATR_MULT_SL * a) if direction == "LONG" else (close + ATR_MULT_SL * a)
-
-    reason.append(f"slope {slope:.5f}")
-    reason.append(f"ATR {a:.5f}")
-    return direction, {"tp": tp, "sl": sl}, ", ".join(reason)
-
-def try_open(pair: str, df: pd.DataFrame):
-    if pair in state["open_positions"]:
-        return
-    sig, trg, why = open_signal(df)
-    if not sig:
-        return
-
-    price = df["close"].iloc[-1]
-    qty = position_size(pair, price, state["equity"], RISK_PCT)
-    if qty <= 0:
-        return
-
-    state["open_positions"][pair] = {
-        "dir": sig,
-        "entry": price,
-        "qty": qty,
-        "tp": trg["tp"],
-        "sl": trg["sl"],
-        "time": datetime.now(timezone.utc),
-        "why": why,
+    state["pairs"][p] = {
+        "pos": None,               # dict|None
+        "last_entry_ts": 0,
+        "stats": {"trades": 0, "wins": 0, "pnl": 0.0},
     }
 
-    emoji = "🔴" if sig == "SHORT" else "🔴"
-    msg = []
-    msg.append(f"{emoji} <b>OPEN {pair} {sig}</b>")
-    msg.append(f"• time: {now_utc_str()}")
-    msg.append(f"• entry: {price:.5f}")
-    msg.append(f"• qty: {qty:.6f}")
-    msg.append(f"• TP: {trg['tp']:.5f}   SL: {trg['sl']:.5f}")
-    msg.append(f"• signal: {why}")
-    msg.append(f"• mode: {'DEMO' if DEMO_MODE else MODE}")
-    tg_send("\n".join(msg))
+# ---------- Утилиты ----------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def check_close(pair: str, df: pd.DataFrame):
-    pos = state["open_positions"].get(pair)
+def tf_to_binance_interval(tf: str) -> str:
+    return tf
+
+def send(msg: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[TG disabled]", msg)
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10,
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+def fmt_pct(x):
+    return f"{x*100:.2f}%"
+
+def fmt_num(x):
+    return f"{x:.5f}"
+
+# ---------- Маркет данные ----------
+def fetch_klines(pair: str, limit: int = 500) -> Optional[pd.DataFrame]:
+    """
+    Свечи с Binance: openTime, open, high, low, close, volume, ...
+    """
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {"symbol": pair, "interval": tf_to_binance_interval(TIMEFRAME), "limit": limit}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data:
+            return None
+        cols = ["t","open","high","low","close","vol","ct","qv","n","tbav","tbqv","i"]
+        df = pd.DataFrame(data, columns=cols)[["t","open","high","low","close","vol"]]
+        for c in ["open","high","low","close","vol"]:
+            df[c] = df[c].astype(float)
+        df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+        return df
+    except Exception:
+        return None
+
+def talib_basic(df: pd.DataFrame) -> pd.DataFrame:
+    # EMA
+    df["ema"] = df["close"].ewm(span=EMA_LEN, adjust=False).mean()
+    # ATR (True Range)
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift(1)).abs()
+    lc = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(ATR_LEN).mean()
+    # slope ema за N баров
+    df["ema_slope"] = df["ema"] - df["ema"].shift(EMA_SLOPE_BARS)
+    return df
+
+# ---------- Паттерны (6 штук) ----------
+def pattern_signals(df: pd.DataFrame) -> Dict[str, bool]:
+    """
+    Берём последний бар (= -2, т.к. -1 может быть незакрытым у некоторых бирж),
+    но для надёжности используем -2.
+    """
+    if len(df) < 10:
+        return {"bull_engulf": False, "bear_engulf": False, "hammer": False, "shooting_star": False, "breakout_up": False, "breakout_down": False}
+    i = -2
+    o, h, l, c = df["open"].iloc[i], df["high"].iloc[i], df["low"].iloc[i], df["close"].iloc[i]
+    op, hp, lp, cp = df["open"].iloc[i-1], df["high"].iloc[i-1], df["low"].iloc[i-1], df["close"].iloc[i-1]
+
+    body = abs(c-o)
+    rng = h-l + 1e-12
+    upper = h - max(c, o)
+    lower = min(c, o) - l
+
+    # 1) Bullish Engulfing
+    bull_engulf = (cp > op) is False and (c > o) and (c >= op) and (o <= cp)
+    # 2) Bearish Engulfing
+    bear_engulf = (cp < op) is False and (c < o) and (c <= op) and (o >= cp)
+    # 3) Hammer (малое тело сверху, длинная нижняя тень)
+    hammer = (c > o) and (lower / rng > 0.55) and (upper / rng < 0.2)
+    # 4) Shooting star (малое тело снизу, длинная верхняя тень)
+    shooting_star = (c < o) and (upper / rng > 0.55) and (lower / rng < 0.2)
+    # 5) Breakout up (пробой максимума N баров)
+    N = 20
+    breakout_up = c > df["high"].iloc[-N-2:-2].max()
+    # 6) Breakout down
+    breakout_down = c < df["low"].iloc[-N-2:-2].min()
+
+    return {
+        "bull_engulf": bool(bull_engulf),
+        "bear_engulf": bool(bear_engulf),
+        "hammer": bool(hammer),
+        "shooting_star": bool(shooting_star),
+        "breakout_up": bool(breakout_up),
+        "breakout_down": bool(breakout_down),
+    }
+
+# ---------- Логика входа/выхода ----------
+def decide_entry(df: pd.DataFrame) -> Optional[Tuple[str, str]]:
+    """
+    Возвращает (side, reason) или None.
+    """
+    sig = pattern_signals(df)
+    slope = df["ema_slope"].iloc[-2]
+
+    # первичное направление по паттернам
+    long_trigs = [sig["bull_engulf"], sig["hammer"], sig["breakout_up"]]
+    short_trigs = [sig["bear_engulf"], sig["shooting_star"], sig["breakout_down"]]
+
+    if any(long_trigs):
+        side = "LONG"
+        reason = ", ".join([k for k, v in sig.items() if v and k in ["bull_engulf","hammer","breakout_up"]])
+    elif any(short_trigs):
+        side = "SHORT"
+        reason = ", ".join([k for k, v in sig.items() if v and k in ["bear_engulf","shooting_star","breakout_down"]])
+    else:
+        return None
+
+    # === TREND GUARD (жёстко как в тесте #9) ===
+    if side == "LONG" and slope <= 0:
+        return None
+    if side == "SHORT" and slope >= 0:
+        return None
+
+    return side, reason
+
+def position_size(pair: str, price: float) -> float:
+    with state_lock:
+        eq = state["equity"]
+    risk_cash = eq * (RISK_PCT / 100.0)
+    # на фьючерсах с плечом можно контролировать через риск -> приблизим qty так,
+    # чтобы потенциальный убыток по SL (в %) не превышал risk_cash.
+    # Если SL считаем как ATR * mult -> дельта цены sl_dist
+    sl_dist = max(1e-8, state["pairs"][pair].get("last_atr", 0.0) * ATR_MULT_SL)
+    # риск ~ qty * sl_dist
+    qty = risk_cash / sl_dist
+    # учитываем плечо (на фьючах маржа ~ price*qty/leverage)
+    # Для демо достаточно ограничить размер относительно эквити:
+    max_qty_by_leverage = (eq * LEVERAGE) / max(price, 1e-8)
+    qty = min(qty, max_qty_by_leverage)
+    return max(qty, 0.0)
+
+def open_position(pair: str, side: str, price: float, df: pd.DataFrame, reason: str):
+    atr = float(df["atr"].iloc[-2])
+    with state_lock:
+        st = state["pairs"][pair]
+        if st["pos"] is not None:
+            return
+        # cooldown
+        if time.time() - st["last_entry_ts"] < COOLDOWN_SEC:
+            return
+        st["last_atr"] = atr
+    qty = position_size(pair, price)
+    if qty <= 0:
+        return
+    # цели
+    if side == "LONG":
+        tp = price * (1 + TP_PCT)
+        sl = price - ATR_MULT_SL * atr
+    else:
+        tp = price * (1 - TP_PCT)
+        sl = price + ATR_MULT_SL * atr
+
+    pos = {
+        "side": side, "entry": price, "qty": qty,
+        "tp": tp, "sl": sl, "ts": time.time(), "reason": reason
+    }
+    with state_lock:
+        state["pairs"][pair]["pos"] = pos
+        state["pairs"][pair]["last_entry_ts"] = time.time()
+
+    send(
+        "🔴 <b>OPEN {pair} {side}</b>\n"
+        "• time: {t}\n"
+        "• entry: {entry:.5f}\n"
+        "• qty: {qty:.6f}\n"
+        "• TP: {tp:.5f}   SL: {sl:.5f}\n"
+        "• signal: {reason}, slope {slope:.5f}, ATR {atr:.5f}\n"
+        "• mode: {mode}".format(
+            pair=pair, side=side, t=now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            entry=price, qty=qty, tp=tp, sl=sl, reason=reason,
+            slope=df["ema_slope"].iloc[-2], atr=atr, mode="DEMO" if DEMO_MODE else "LIVE"
+        )
+    )
+
+def close_position(pair: str, exit_price: float, tag: str):
+    with state_lock:
+        pos = state["pairs"][pair]["pos"]
+        if pos is None:
+            return
+        side = pos["side"]
+        entry = pos["entry"]
+        qty = pos["qty"]
+        # PnL (без учёта фи и плечо уже в размере позиции)
+        pnl = (exit_price - entry) * qty if side == "LONG" else (entry - exit_price) * qty
+        # комиссии (2 стороны)
+        fee = (abs(entry) + abs(exit_price)) * qty * FEE_PCT
+        pnl -= fee
+        # обновляем equity
+        state["equity"] += pnl
+        # статистика
+        st = state["pairs"][pair]["stats"]
+        st["trades"] += 1
+        st["pnl"] += pnl
+        if pnl > 0:
+            st["wins"] += 1
+        state["pairs"][pair]["pos"] = None
+
+        total_trades = sum(state["pairs"][p]["stats"]["trades"] for p in state["pairs"])
+        total_wins = sum(state["pairs"][p]["stats"]["wins"] for p in state["pairs"])
+        total_pnl = sum(state["pairs"][p]["stats"]["pnl"] for p in state["pairs"])
+        wr_pair = (st["wins"] / st["trades"] * 100.0) if st["trades"] else 0.0
+        wr_total = (total_wins / total_trades * 100.0) if total_trades else 0.0
+        delta = state["equity"] - state["start_equity"]
+        delta_pct = 100.0 * (delta / state["start_equity"])
+
+    mark = "✅" if pnl > 0 else "❌"
+    send(
+        "{mark} <b>CLOSE {pair} ({tag})</b>\n"
+        "• time: {t}\n"
+        "• exit: {exit:.5f}\n"
+        "• PnL: {pnl:+.5f}\n"
+        "• pair stats: trades {pt}, WR {pwr:.2f}%, PnL {ppnl:.5f}\n"
+        "• total: trades {tt}, WR {twr:.2f}%, PnL {tpnl:.5f}\n"
+        "• balance: {eq:.5f}  (Δ {d:+.5f} | {dp:.2f}%)\n"
+        "• since start: {dp:.2f}%   (lev {lev:.1f}x, fee {fee:.3f}%)".format(
+            mark=mark, pair=pair, tag=tag, t=now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            exit=exit_price, pnl=pnl,
+            pt=st["trades"], pwr=wr_pair, ppnl=st["pnl"],
+            tt=total_trades, twr=wr_total, tpnl=total_pnl,
+            eq=state["equity"], d=delta, dp=delta_pct, lev=LEVERAGE, fee=FEE_PCT*100
+        )
+    )
+
+def check_exit(pair: str, last_price: float):
+    with state_lock:
+        pos = state["pairs"][pair]["pos"]
     if not pos:
         return
-
-    high = df["high"].iloc[-1]
-    low = df["low"].iloc[-1]
-    exit_price = None
-    reason = None
-
-    if pos["dir"] == "LONG":
-        if high >= pos["tp"]:
-            exit_price = pos["tp"]; reason = "TP"
-        elif low <= pos["sl"]:
-            exit_price = pos["sl"]; reason = "SL"
-    else:  # SHORT
-        if low <= pos["tp"]:
-            exit_price = pos["tp"]; reason = "TP"
-        elif high >= pos["sl"]:
-            exit_price = pos["sl"]; reason = "SL"
-
-    if exit_price is None:
-        return
-
-    # --- закрываем ---
-    entry = pos["entry"]
-    qty = pos["qty"]
-    side = pos["dir"]
-
-    # Комиссии за вход и выход
-    fee_in = entry * qty * FEE_PCT
-    fee_out = exit_price * qty * FEE_PCT
-
-    if side == "LONG":
-        pnl = (exit_price - entry) * qty - fee_in - fee_out
+    if pos["side"] == "LONG":
+        if last_price >= pos["tp"]:
+            close_position(pair, pos["tp"], "TP")
+        elif last_price <= pos["sl"]:
+            close_position(pair, pos["sl"], "SL")
     else:
-        pnl = (entry - exit_price) * qty - fee_in - fee_out
+        if last_price <= pos["tp"]:
+            close_position(pair, pos["tp"], "TP")
+        elif last_price >= pos["sl"]:
+            close_position(pair, pos["sl"], "SL")
 
-    state["equity"] += pnl
-    state["total"]["pnl"] += pnl
-    state["total"]["trades"] += 1
-
-    st = state["stats"][pair]
-    st["pnl"] += pnl
-    st["trades"] += 1
-    if pnl >= 0:
-        st["wins"] += 1
-        state["total"]["wins"] += 1
-        emoji = "✅"
-    else:
-        st["losses"] += 1
-        state["total"]["losses"] += 1
-        emoji = "❌"
-
-    del state["open_positions"][pair]
-
-    # Сообщение о закрытии
-    wr_pair = (st["wins"] / st["trades"] * 100.0) if st["trades"] else 0.0
-    wr_total = (state["total"]["wins"] / state["total"]["trades"] * 100.0) if state["total"]["trades"] else 0.0
-
-    msg = []
-    msg.append(f"{emoji} <b>CLOSE {pair} ({reason})</b>")
-    msg.append(f"• time: {now_utc_str()}")
-    msg.append(f"• exit: {exit_price:.5f}")
-    msg.append(f"• PnL: {pnl:+.5f}")
-    msg.append(f"• pair stats: trades {st['trades']}, WR {wr_pair:.2f}%, PnL {st['pnl']:.5f}")
-    msg.append(f"• total: trades {state['total']['trades']}, WR {wr_total:.2f}%, PnL {state['total']['pnl']:.5f}")
-    msg.append(f"• balance: {state['equity']:.5f}   (Δ {state['equity']-state['start_equity']:+.5f} | {((state['equity']/state['start_equity'])-1)*100:.2f}%)")
-    msg.append(f"• since start: {((state['equity']/state['start_equity'])-1)*100:.2f}%   (lev {LEVERAGE:.1f}x, fee {FEE_PCT:.3%})")
-    tg_send("\n".join(msg))
-
-
-# =========================
-# ------- LOOP ------------
-# =========================
-
+# ---------- Цикл по паре ----------
 def pair_loop(pair: str):
-    tg_send(f"✅ Loop started for <b>{pair}</b>")
+    send(f"✅ Loop started for <b>{pair}</b>")
     while True:
         try:
-            df = get_klines(pair, TIMEFRAME, limit=300)
-            if df is None or df.empty:
-                tg_send(f"⚠️ {pair} loop error: <code>no klines</code> for {pair}")
-                time.sleep(TICK_SECONDS)
+            df = fetch_klines(pair, limit=500)
+            if df is None or len(df) < max(ATR_LEN, EMA_LEN)+EMA_SLOPE_BARS+5:
+                send(f"⚠️ {pair} loop error: no  klines  for {pair}")
+                time.sleep(TICK_SEC)
                 continue
 
-            # индикаторы для сигналов
-            df["ema"] = ema(df["close"], EMA_LEN)
-            df["atr"] = atr(df, ATR_LEN)
+            df = talib_basic(df)
+            last_price = float(df["close"].iloc[-1])
 
-            # последовательность: сначала проверяем закрытие, потом новые открытия
-            check_close(pair, df)
-            try_open(pair, df)
+            # 1) Выход по TP/SL
+            check_exit(pair, last_price)
+
+            # 2) Вход (если позиции нет)
+            with state_lock:
+                has_pos = state["pairs"][pair]["pos"] is not None
+            if not has_pos:
+                dec = decide_entry(df)
+                if dec:
+                    side, reason = dec
+                    open_position(pair, side, float(df["close"].iloc[-2]), df, reason)
+
+            # 3) Ежедневная сводка (UTC)
+            if DAILY_SUMMARY:
+                with state_lock:
+                    if state["day_anchor"] != now_utc().date():
+                        state["day_anchor"] = now_utc().date()
+                        send(status_text())
 
         except Exception as e:
-            tg_send(f"⚠️ {pair} loop error: {e}")
+            print(f"{pair} loop error:", e)
+            traceback.print_exc()
+        time.sleep(TICK_SEC)
 
-        time.sleep(TICK_SECONDS)
+# ---------- Команды TG ----------
+def status_text() -> str:
+    with state_lock:
+        lines = [f"📊 <b>STATUS {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}</b>"]
+        total_tr, total_wins, total_pnl = 0, 0, 0.0
+        for pair, ps in state["pairs"].items():
+            st = ps["stats"]
+            pos = ps["pos"]
+            total_tr += st["trades"]; total_wins += st["wins"]; total_pnl += st["pnl"]
+            wr = (st["wins"]/st["trades"]*100.0) if st["trades"] else 0.0
+            lines.append(f"<b>{pair}</b> • trades: {st['trades']}  WR: {wr:.2f}%  PnL: {fmt_num(st['pnl'])}")
+            if pos:
+                lines.append(f"{pos['qty']:.6f}  pos: <b>{pos['side']}</b> @ {pos['entry']:.5f} (TP {pos['tp']:.5f} / SL {pos['sl']:.5f})")
+            else:
+                lines.append("0.00000  pos: —")
+        twr = (total_wins/total_tr*100.0) if total_tr else 0.0
+        lines.append("—")
+        lines.append(f"<b>TOTAL</b> • trades: {total_tr}  WR: {twr:.2f}%  PnL: {fmt_num(total_pnl)}")
+        delta = state["equity"] - state["start_equity"]
+        dp = 100.0 * delta / state["start_equity"]
+        lines.append(f"equity: {state['equity']:.5f}  ({dp:.2f}% с начала)")
+        lines.append(f"leverage: {LEVERAGE:.1f}x  fee: {FEE_PCT*100:.3f}%")
+    return "\n".join(lines)
 
-# =========================
-# ----- TELEGRAM BOT ------
-# =========================
+def cmd_start(update, context):
+    msg = (
+        "🤖 <b>mybot9 started successfully!</b>\n"
+        f"Mode: <b>{'DEMO' if DEMO_MODE else 'LIVE'}</b> | Leverage <b>{LEVERAGE:.1f}x</b> | Fee <b>{FEE_PCT*100:.3f}%</b> | "
+        f"Risk <b>{RISK_PCT:.1f}%</b>\n"
+        f"Pairs: {', '.join(PAIRS)} | TF <b>{TIMEFRAME}</b> | Tick <b>{TICK_SEC}s</b>\n"
+        f"Balance: {state['equity']:.2f}  USDT"
+    )
+    send(msg)
+    update.message.reply_text("ok")
 
 def cmd_status(update, context):
-    lines = [f"📊 <b>STATUS {now_utc_str()}</b>"]
-    total_trades = state["total"]["trades"]
-    total_wr = (state["total"]["wins"] / total_trades * 100.0) if total_trades else 0.0
-    for p in PAIRS:
-        st = state["stats"][p]
-        wr = (st["wins"] / st["trades"] * 100.0) if st["trades"] else 0.0
-        lines.append(f"<b>{p}</b> • trades: {st['trades']}  WR: {wr:.2f}%  PnL: {st['pnl']:.5f}")
-        pos = state["open_positions"].get(p)
-        if pos:
-            lines.append(f"{'%.5f' % pos['entry']}  pos: {pos['dir']} @ {pos['entry']:.5f} (TP {pos['tp']:.5f} / SL {pos['sl']:.5f})")
-        else:
-            lines.append("0.00000  pos: —")
-    lines.append("—")
-    lines.append(f"<b>TOTAL</b> • trades: {total_trades}  WR: {total_wr:.2f}%  PnL: {state['total']['pnl']:.5f}")
-    lines.append(f"equity: {state['equity']:.5f}  ({((state['equity']/state['start_equity'])-1)*100:.2f}% с начала)")
-    lines.append(f"leverage: {LEVERAGE:.1f}x  fee: {FEE_PCT:.3%}")
-    update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    update.message.reply_text(status_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-def start_bot():
+# ---------- Main ----------
+def main():
+    # Telegram
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("status", cmd_status))
 
-    # очистим возможные «висячие» апдейты (аналог drop_pending_updates)
-    try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                     params={"offset": -1}, timeout=10)
-    except Exception:
-        pass
-
-    # запуск
-    updater.start_polling(clean=True)
-    tg_send(f"🤖 <b>mybot9</b> started successfully!\n"
-            f"Mode: <b>{'DEMO' if DEMO_MODE else MODE}</b> | Leverage <b>{LEVERAGE:.1f}x</b> | Fee <b>{FEE_PCT:.3%}</b> | Risk <b>{RISK_PCT:.1f}%</b>\n"
-            f"Pairs: {', '.join(PAIRS)} | TF <b>{TIMEFRAME}</b> | Tick <b>{TICK_SECONDS}s</b>\n"
-            f"Balance: <b>{state['equity']:.2f}</b>  USDT")
-
-    # фоновые потоки по каждому инструменту
+    # Запуск потоков по парам
     for p in PAIRS:
-        threading.Thread(target=pair_loop, args=(p,), daemon=True).start()
+        th = threading.Thread(target=pair_loop, args=(p,), daemon=True)
+        th.start()
 
-    updater.idle()
-
-# =========================
-# ---- HEALTH SERVER  -----
-# =========================
-
-class Quiet(BaseHTTPRequestHandler):
-    def log_message(self, *args, **kwargs):
-        return
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def start_health_http_server():
-    port = int(os.getenv("PORT", "8080"))
+    # Поллинг. В Koyeb/Heroku иногда параллельные инстансы дают конфликт.
+    # drop_pending_updates=True аналог clean=True, чтобы не зависать на древних апдейтах.
     try:
-        httpd = HTTPServer(("0.0.0.0", port), Quiet)
-    except OSError:
-        # порт занят — не мешаем основному боту
-        return
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-
-# =========================
-# --------- MAIN ----------
-# =========================
+        updater.start_polling(drop_pending_updates=True)
+        # ping-сервер здоровья (best-effort), игнорируем занятый порт
+        try:
+            import http.server, socketserver
+            class Quiet(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, *a): pass
+            PORT = 8080
+            def serve():
+                with socketserver.TCPServer(("0.0.0.0", PORT), Quiet) as httpd:
+                    httpd.serve_forever()
+            threading.Thread(target=serve, daemon=True).start()
+        except Exception:
+            pass
+        # Сообщение о запуске
+        send(
+            "🤖 <b>mybot9 started successfully!</b>\n"
+            f"Mode: <b>{'DEMO' if DEMO_MODE else 'LIVE'}</b> | Leverage <b>{LEVERAGE:.1f}x</b> | Fee <b>{FEE_PCT*100:.3f}%</b> | Risk <b>{RISK_PCT:.1f}%</b>\n"
+            f"Pairs: {', '.join(PAIRS)} | TF <b>{TIMEFRAME}</b> | Tick <b>{TICK_SEC}s</b>\n"
+            f"Balance: {state['equity']:.2f}  USDT"
+        )
+        updater.idle()
+    except Exception as e:
+        # Если где-то крутится второй инстанс — Telegram вернёт Conflict.
+        # Просто логируем и продолжаем фоны (бот всё равно торгует/шлёт send() через API).
+        send(f"⚠️ Telegram polling error: {e}")
 
 if __name__ == "__main__":
-    start_health_http_server()
-    start_bot()
+    main()
