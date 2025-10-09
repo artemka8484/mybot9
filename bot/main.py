@@ -134,8 +134,7 @@ def fetch_klines(pair: str, limit: int = 200) -> pd.DataFrame:
     sym = pair.replace("/", "").upper()
     interval = _mexc_tf(TIMEFRAME)
     url_variants = [
-        f"{MEXC_BASE_URL}/api/v1/contract/kline/{sym}?interval={interval}&limit={limit}",
-        f"{MEXC_BASE_URL}/api/v1/contract/kline?symbol={sym}&interval={interval}&limit={limit}",
+    f"{MEXC_BASE_URL}/api/v1/contract/kline?symbol={sym.replace('USDT','_USDT')}&interval={interval}&limit={limit}",
     ]
     data = None
     for url in url_variants:
