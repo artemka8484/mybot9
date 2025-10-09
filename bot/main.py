@@ -1,6 +1,7 @@
 # /workspace/bot/main.py
 import os
 import json
+import asyncio
 from datetime import datetime, timezone
 
 import httpx
@@ -106,14 +107,14 @@ def strategy9(df: pd.DataFrame) -> dict:
     return {"signal":None,"reason":"no_setup","ema_slope":slope,"patterns":patt}
 
 # ----------------------- TRADING (DEMO) -----------------------
-async def open_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: float, side: str):
+async def open_position_via_app(app: Application, st: PairState, price: float, side: str):
     st.pos_open, st.side, st.entry, st.qty = True, side, price, TRADE_SIZE
     if side=="LONG":
         st.tp = price*(1+TP_PCT/100); st.sl = price*(1-SL_PCT/100)
     else:
         st.tp = price*(1-TP_PCT/100); st.sl = price*(1+SL_PCT/100)
     icon = "🟢" if side=="LONG" else "🔴"
-    await ctx.bot.send_message(
+    await app.bot.send_message(
         CHAT_ID,
         (f"{icon} <b>OPEN</b> {st.pair} {side}\n"
          f"• time: {now_utc_str()}\n"
@@ -124,7 +125,7 @@ async def open_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: fl
         parse_mode=constants.ParseMode.HTML
     )
 
-async def close_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: float, reason: str):
+async def close_position_via_app(app: Application, st: PairState, price: float, reason: str):
     if not st.pos_open: return
     side = st.side
     pnl = (price-st.entry)*st.qty if side=="LONG" else (st.entry-price)*st.qty
@@ -135,7 +136,7 @@ async def close_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: f
     if win: st.wins += 1; GLOBAL["wins"] += 1
     icon = "✅" if win else "❌"; sign = "+" if pnl>=0 else "−"
     total_wr = (GLOBAL["wins"]/GLOBAL["closed"]*100) if GLOBAL["closed"] else 0.0
-    await ctx.bot.send_message(
+    await app.bot.send_message(
         CHAT_ID,
         (f"{icon} <b>CLOSE</b> {st.pair} ({reason})\n"
          f"• time: {now_utc_str()}\n"
@@ -146,43 +147,45 @@ async def close_position(ctx: ContextTypes.DEFAULT_TYPE, st: PairState, price: f
         parse_mode=constants.ParseMode.HTML
     )
 
-# ----------------------- PER-PAIR JOB -----------------------
-async def pair_job(ctx: ContextTypes.DEFAULT_TYPE):
-    pair = ctx.job.data["pair"]
+# ----------------------- BACKGROUND LOOPS (no JobQueue) -----------------------
+async def pair_loop(app: Application, pair: str):
     st = STATES[pair]
-    try:
-        df = await fetch_klines(pair, TIMEFRAME, 150)
-        if df.empty: return
-        last = float(df["close"].iloc[-1])
+    await asyncio.sleep(2)  # маленькая задержка старта
+    while True:
+        try:
+            df = await fetch_klines(pair, TIMEFRAME, 150)
+            if df.empty:
+                await asyncio.sleep(TICK_SECONDS); continue
+            last = float(df["close"].iloc[-1])
 
-        # manage open position
-        if st.pos_open:
-            if st.side=="LONG":
-                if last>=st.tp: return await close_position(ctx, st, last, "TP")
-                if last<=st.sl: return await close_position(ctx, st, last, "SL")
+            # управляем открытой позицией
+            if st.pos_open:
+                if st.side=="LONG":
+                    if last>=st.tp: await close_position_via_app(app, st, last, "TP")
+                    elif last<=st.sl: await close_position_via_app(app, st, last, "SL")
+                else:
+                    if last<=st.tp: await close_position_via_app(app, st, last, "TP")
+                    elif last>=st.sl: await close_position_via_app(app, st, last, "SL")
             else:
-                if last<=st.tp: return await close_position(ctx, st, last, "TP")
-                if last>=st.sl: return await close_position(ctx, st, last, "SL")
+                # ищем новый вход
+                sig = strategy9(df)
+                if DEBUG_TELEMETRY and sig["signal"]:
+                    await app.bot.send_message(
+                        CHAT_ID,
+                        ("🧪 <b>DEBUG</b>\n"
+                         f"• pair: <b>{pair}</b>\n"
+                         f"• last_close: <code>{fmt_money(last)}</code>\n"
+                         f"• EMA48_slope(5 bars): <code>{sig['ema_slope']:.6f}</code>\n"
+                         f"• patterns: <code>{json.dumps(sig['patterns'])}</code>"),
+                        parse_mode=constants.ParseMode.HTML
+                    )
+                if sig["signal"] in ("LONG","SHORT"):
+                    await open_position_via_app(app, st, last, sig["signal"])
 
-        # new signal
-        sig = strategy9(df)
-        if DEBUG_TELEMETRY and (sig["signal"] or (ctx.job.data.setdefault("dbg",0)+1)%12==0):
-            ctx.job.data["dbg"] = ctx.job.data.get("dbg",0)+1
-            await ctx.bot.send_message(
-                CHAT_ID,
-                ("🧪 <b>DEBUG</b>\n"
-                 f"• pair: <b>{pair}</b>\n"
-                 f"• last_close: <code>{fmt_money(last)}</code>\n"
-                 f"• EMA48_slope(5 bars): <code>{sig['ema_slope']:.6f}</code>\n"
-                 f"• patterns: <code>{json.dumps(sig['patterns'])}</code>\n"
-                 f"• pos_open: <b>{st.pos_open}</b>"),
-                parse_mode=constants.ParseMode.HTML
-            )
-        if not st.pos_open and sig["signal"] in ("LONG","SHORT"):
-            await open_position(ctx, st, last, sig["signal"])
+        except Exception as e:
+            logger.exception(e)
 
-    except Exception as e:
-        logger.exception(e)
+        await asyncio.sleep(TICK_SECONDS)
 
 # ----------------------- COMMANDS -----------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,19 +209,29 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"—\nTOTAL • trades: {GLOBAL['closed']}  WR: {fmt_pct(total_wr)}  PnL: {fmt_money(GLOBAL['pnl'])}")
     await update.message.reply_html("\n".join(lines))
 
-# ----------------------- BUILD & RUN -----------------------
+# ----------------------- APP BUILD -----------------------
+async def post_init(app: Application):
+    # стартуем фоновые циклы без JobQueue
+    for p in PAIRS:
+        app.create_task(pair_loop(app, p))
+    logger.info("Background loops started")
+
 def build_app() -> Application:
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)   # важное место: стартуем фоновые таски тут
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
-    for p in PAIRS:
-        app.job_queue.run_repeating(pair_job, interval=TICK_SECONDS, first=2, data={"pair": p})
     return app
 
+# ----------------------- MAIN -----------------------
 def main():
     logger.info("🤖 mybot9 started successfully!")
     app = build_app()
-    # run_polling сам делает initialize/start/stop — никаких своих серверов не поднимаем
+    # run_polling сам делает initialize/start/stop
     app.run_polling(allowed_updates=constants.Update.ALL_TYPES)
 
 if __name__ == "__main__":
