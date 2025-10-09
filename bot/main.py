@@ -8,17 +8,17 @@ import httpx
 import pandas as pd
 from loguru import logger
 
-from bot.strategy9 import decide  # наша логика сигналов (EMA48 + свечные + ATR)
+from bot.strategy9 import decide, ema, candle_patterns  # добавили ema, candle_patterns
 
 # ====== ENV ======
 PAIR = os.getenv("PAIR", "BTCUSDT")
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")           # 1m/5m/15m/1h...
-DEMO_MODE = os.getenv("DEMO_MODE", "1") == "1"     # 1 = демо
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")              # чаще сигналы
+DEMO_MODE = os.getenv("DEMO_MODE", "1") == "1"        # 1 = демо
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
 DEMO_START_BALANCE = float(os.getenv("DEMO_START_BALANCE", "10000"))
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DEBUG_TELEMETRY = os.getenv("DEBUG_TELEMETRY", "0") == "1"  # NEW
 
 # ====== Telegram ======
 async def tg_send(text: str) -> None:
@@ -42,17 +42,15 @@ async def get_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFra
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
-        raw = r.json()  # список списков
+        raw = r.json()
     rows = []
     for k in raw:
         try:
-            # [0] openTime, [1] open, [2] high, [3] low, [4] close, [5] volume, [6] closeTime, [7] quoteVolume, ...
             open_, high, low, close, volume = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
             rows.append([int(k[0]), open_, high, low, close, volume])
         except Exception:
             continue
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
-    return df
+    return pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
 
 # ====== DEMO portfolio / position ======
 Side = Literal["LONG", "SHORT"]
@@ -70,12 +68,7 @@ class Position:
         return self.side is not None and self.qty > 0 and self.entry is not None
 
     def reset(self) -> None:
-        self.side = None
-        self.qty = 0.0
-        self.entry = None
-        self.tp = None
-        self.sl = None
-        self.reason = ""
+        self.__init__()
 
 class DemoAccount:
     def __init__(self, start_balance: float) -> None:
@@ -97,15 +90,14 @@ class DemoAccount:
 
 account = DemoAccount(DEMO_START_BALANCE)
 
-# ====== DEMO execution (симуляция TP/SL) ======
+# ====== DEMO execution (TP/SL симуляция) ======
 async def open_position(price: float, side: Side, atr_value: float, reason: str) -> None:
     if account.pos.is_open():
-        return  # игнор, пока позиция открыта
+        return
     qty = TRADE_SIZE
     account.pos.side = side
     account.pos.qty = qty
     account.pos.entry = price
-    # SL=0.5*ATR, TP=1.0*ATR от цены входа
     if side == "LONG":
         account.pos.tp = price + 1.0 * atr_value
         account.pos.sl = price - 0.5 * atr_value
@@ -113,7 +105,6 @@ async def open_position(price: float, side: Side, atr_value: float, reason: str)
         account.pos.tp = price - 1.0 * atr_value
         account.pos.sl = price + 0.5 * atr_value
     account.pos.reason = reason
-
     await tg_send(
         "🚀 <b>OPEN</b>\n"
         f"• {side} {qty} {PAIR}\n"
@@ -126,28 +117,18 @@ async def open_position(price: float, side: Side, atr_value: float, reason: str)
 async def try_close_position(last_close: float) -> None:
     if not account.pos.is_open():
         return
-    side = account.pos.side
-    entry = account.pos.entry or last_close
-    tp = account.pos.tp or last_close
-    sl = account.pos.sl or last_close
-    qty = account.pos.qty
-
+    side, entry, tp, sl, qty = account.pos.side, account.pos.entry, account.pos.tp, account.pos.sl, account.pos.qty
     hit_tp = (last_close >= tp) if side == "LONG" else (last_close <= tp)
     hit_sl = (last_close <= sl) if side == "LONG" else (last_close >= sl)
     if not (hit_tp or hit_sl):
         return
-
-    # Исполнение по цене срабатывания (берём last_close)
     exit_price = last_close
     pnl = (exit_price - entry) * qty if side == "LONG" else (entry - exit_price) * qty
     account.usdt += pnl
     account.realized_pnl += pnl
     account.trades += 1
-    if pnl > 0:
-        account.wins += 1
-    elif pnl < 0:
-        account.losses += 1
-
+    if pnl > 0: account.wins += 1
+    elif pnl < 0: account.losses += 1
     tag = "✅ TP" if hit_tp else "⛔ SL"
     await tg_send(
         f"{tag} <b>CLOSE</b>\n"
@@ -163,32 +144,43 @@ async def try_close_position(last_close: float) -> None:
 async def run_bot():
     logger.info("🤖 mybot9 started successfully!")
     await tg_send(f"✅ mybot9 running (DEMO)\nPAIR: <b>{PAIR}</b> TF: <b>{TIMEFRAME}</b>")
+    diag_tick = 0  # счётчик для телеметрии
 
     while True:
         try:
             df = await get_klines(PAIR, TIMEFRAME, limit=120)
         except Exception as e:
             logger.warning(f"Klines fetch failed: {e}")
-            await asyncio.sleep(5)
-            continue
+            await asyncio.sleep(5); continue
 
         if len(df) < 60:
-            await asyncio.sleep(5)
-            continue
+            await asyncio.sleep(5); continue
 
-        # 1) если позиция открыта — проверяем TP/SL по последней цене
-        last_close = float(df["close"].iloc[-1])
+        last_close = float(df['close'].iloc[-1])
+
+        # 1) закрытие по TP/SL если позиция есть
         await try_close_position(last_close)
 
-        # 2) если позиции нет — ищем вход по стратегии #9
+        # 2) поиск входа
         if not account.pos.is_open():
-            sig = decide(df)  # {'side': 'LONG'|'SHORT', 'reason': str, 'atr': float} или None
+            sig = decide(df)  # {'side','reason','atr'} or None
             if sig and DEMO_MODE:
                 await open_position(price=last_close, side=sig["side"], atr_value=float(sig["atr"]), reason=sig["reason"])
 
-        # каждые 20 итераций — сводка
-        if account.trades > 0 and account.trades % 20 == 0 and not account.pos.is_open():
-            await tg_send(account.summary())
+        # 3) DEBUG телеметрия (каждые ~60 секунд при 1m tf)
+        if DEBUG_TELEMETRY:
+            diag_tick += 1
+            if diag_tick % 6 == 0:
+                e48 = ema(df["close"], 48)
+                slope48 = float(e48.iloc[-1] - e48.iloc[-6])
+                patt = candle_patterns(df)
+                await tg_send(
+                    "🧪 <b>DEBUG</b>\n"
+                    f"• last_close: <b>{last_close:.2f}</b>\n"
+                    f"• EMA48_slope(5 bars): <b>{slope48:+.4f}</b>\n"
+                    f"• patterns: <code>{patt}</code>\n"
+                    f"• pos_open: <b>{account.pos.is_open()}</b>"
+                )
 
         logger.info("Bot is alive... waiting for signals")
         await asyncio.sleep(10)
