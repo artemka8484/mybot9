@@ -1,97 +1,153 @@
+# bot/main.py
 import os
 import asyncio
-import datetime
-import random
-import pandas as pd
-import httpx
+from datetime import datetime, timezone
 from loguru import logger
-from telegram import Bot
+import httpx
 
-# === Переменные окружения ===
-API_KEY = os.getenv("MEXC_API_KEY", "")
-API_SECRET = os.getenv("MEXC_API_SECRET", "")
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-PAIRS = os.getenv("PAIRS", "BTCUSDT,ETHUSDT").split(",")
-TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+# ---------- ENV ----------
+PAIR = os.getenv("PAIR", "BTCUSDT")
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")  # пока не используем, просто для вида
 DEMO_MODE = os.getenv("DEMO_MODE", "1") == "1"
+TRADE_SIZE = float(os.getenv("TRADE_SIZE", "0.001"))  # в базовой валюте (BTC при BTCUSDT)
+START_BALANCE = float(os.getenv("DEMO_START_BALANCE", "10000"))  # USD(T)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-bot = Bot(token=TG_TOKEN)
+# ---------- Telegram helpers ----------
+async def tg_send(text: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            await client.post(url, json=payload)
+        except Exception as e:
+            logger.warning(f"Telegram send failed: {e}")
 
-
-# === Telegram ===
-async def send_message(text):
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-
-
-# === Получение свечей ===
-async def get_klines(pair):
-    url = f"https://api.mexc.com/api/v3/klines?symbol={pair}&interval={TIMEFRAME}&limit=100"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url)
+# ---------- Market data ----------
+async def fetch_price(symbol: str) -> float:
+    url = f"https://api.mexc.com/api/v3/ticker/price"
+    params = {"symbol": symbol}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
-        raw = r.json()
+        data = r.json()
+        return float(data["price"])
 
-        # Формируем DataFrame с безопасной структурой
-        rows = []
-        for k in raw:
-            try:
-                open_, high, low, close, volume = (
-                    float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
-                )
-                rows.append([int(k[0]), open_, high, low, close, volume])
-            except Exception:
-                continue
+# ---------- Simple demo strategy (#9 placeholder) ----------
+# тут просто чередуем BUY/SELL каждые ~12 сек, берём реальную последнюю цену
+async def strategy_signal(counter: int) -> str:
+    return "BUY" if counter % 2 == 1 else "SELL"
 
-        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
-        return df
+# ---------- DEMO portfolio state ----------
+class DemoState:
+    def __init__(self) -> None:
+        self.usdt = START_BALANCE
+        self.base = 0.0  # BTC количество
+        self.entry_price = None  # цена входа для позиции (long)
+        self.realized_pnl = 0.0
+        self.trades = 0
+        self.wins = 0
+        self.losses = 0
 
+    def summary_text(self) -> str:
+        equity = self.usdt + (self.base * last_price if (last_price := 0) else self.usdt)
+        # Для краткости, equity без mark-to-market, чтобы не дёргать цену тут
+        return (
+            f"💼 <b>DEMO summary</b>\n"
+            f"• Balance: <b>{self.usdt:.2f} USDT</b>\n"
+            f"• Realized PnL: <b>{self.realized_pnl:.2f} USDT</b>\n"
+            f"• Trades: <b>{self.trades}</b> | Win-rate: <b>{(self.wins*100/max(1,self.trades)):.1f}%</b>"
+        )
 
-# === Простая стратегия SMA5/SMA20 ===
-async def strategy(pair):
-    df = await get_klines(pair)
-    if len(df) < 25:
-        return None
+state = DemoState()
 
-    df["sma5"] = df["close"].rolling(5).mean()
-    df["sma20"] = df["close"].rolling(20).mean()
+# ---------- Trade executor ----------
+async def execute_trade(side: str, price: float) -> None:
+    """
+    В DEMO:
+      BUY  -> покупаем TRADE_SIZE BTC по price (тратим USDT)
+      SELL -> если есть позиция, продаём весь объём (или TRADE_SIZE, но ниже закрываем всю позицию)
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if DEMO_MODE:
+        note = "без реального ордера"
+        if side == "BUY":
+            # Покупаем TRADE_SIZE BTC
+            cost = TRADE_SIZE * price
+            state.usdt -= cost
+            state.base += TRADE_SIZE
+            state.entry_price = price if state.entry_price is None else state.entry_price
+            state.trades += 1
+            await tg_send(
+                "🧪 <b>DEMO trade</b>\n"
+                f"• <b>BUY</b> {TRADE_SIZE:.3f} {PAIR.replace('USDT','')}/USDT @ <b>{price:.2f}</b>\n"
+                f"• Время: <code>{ts}</code>\n"
+                "• Стратегия: #9\n"
+                f"• Исполнение: {note}"
+            )
+        else:  # SELL
+            # Закрываем весь объём, если он есть; если нет — делаем короткую имитацию на TRADE_SIZE
+            qty = state.base if state.base > 0 else TRADE_SIZE
+            pnl = 0.0
+            if state.base > 0 and state.entry_price is not None:
+                pnl = qty * (price - state.entry_price)
+            # Обновляем балансы
+            state.usdt += qty * price
+            state.base -= qty
+            # PnL учитываем только при закрытии лонга
+            if pnl != 0.0:
+                state.realized_pnl += pnl
+                if pnl > 0:
+                    state.wins += 1
+                else:
+                    state.losses += 1
+            state.entry_price = None if state.base <= 0 else state.entry_price
+            state.trades += 1
+            sign = "▲" if pnl > 0 else ("▼" if pnl < 0 else "•")
+            await tg_send(
+                "🧪 <b>DEMO trade</b>\n"
+                f"• <b>SELL</b> {qty:.3f} {PAIR.replace('USDT','')}/USDT @ <b>{price:.2f}</b>\n"
+                f"• Время: <code>{ts}</code>\n"
+                "• Стратегия: #9\n"
+                f"• PnL: <b>{sign} {pnl:.2f} USDT</b>\n"
+                f"• Баланс: <b>{state.usdt:.2f} USDT</b>\n"
+                f"• Исполнение: {note}"
+            )
+    else:
+        # прод-вариант (реальные ордера) — не используется сейчас
+        pass
 
-    if df["sma5"].iloc[-2] < df["sma20"].iloc[-2] and df["sma5"].iloc[-1] > df["sma20"].iloc[-1]:
-        return "BUY"
-    if df["sma5"].iloc[-2] > df["sma20"].iloc[-2] and df["sma5"].iloc[-1] < df["sma20"].iloc[-1]:
-        return "SELL"
-    return None
-
-
-# === Главный цикл ===
+# ---------- Main loop ----------
 async def run_bot():
     logger.info("🤖 mybot9 started successfully!")
-    await send_message("✅ mybot9 is running with strategy #9 (DEMO mode active)")
-    trade_id = 0
+    if DEMO_MODE:
+        await tg_send("✅ mybot9 is running with strategy #9\n(DEMO mode active)")
 
+    counter = 0
     while True:
-        for pair in PAIRS:
-            signal = await strategy(pair)
-            if signal:
-                trade_id += 1
-                price = round(random.uniform(60000, 60500), 2)
-                ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                msg = (
-                    f"📈 <b>DEMO trade #{trade_id}</b>\n"
-                    f"• {signal} {TRADE_SIZE} {pair} @ {price}\n"
-                    f"• Время: {ts}\n• Стратегия: #9\n"
-                    f"• Исполнение: без реального ордера"
-                )
-                logger.info(f"[DEMO] {signal} {pair} @ {price}")
-                await send_message(msg)
-            await asyncio.sleep(3)
+        try:
+            price = await fetch_price(PAIR)
+        except Exception as e:
+            logger.warning(f"Price fetch failed: {e}")
+            await asyncio.sleep(5)
+            continue
 
-        await asyncio.sleep(20)
+        counter += 1
+        side = await strategy_signal(counter)
+        await execute_trade(side, price)
 
+        # Каждые 10 операций — краткий отчёт
+        if DEMO_MODE and state.trades % 10 == 0:
+            await tg_send(state.summary_text())
+
+        logger.info("Bot is alive... waiting for signals")
+        await asyncio.sleep(12)  # частота "сигналов" в демо
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.warning("Bot stopped manually.")
