@@ -22,10 +22,10 @@ CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 # режимы приема апдейтов
 USE_WEBHOOK = os.getenv("USE_WEBHOOK", "false").lower() in ("1", "true", "yes")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()        # напр. https://mybot9.koyeb.app/tg
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/tg").strip()   # путь на нашем сервере
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mybot9-secret")  # необязательный secret
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/tg").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mybot9-secret")
 
-# прочее
+# торговые параметры
 PAIRS = [p.strip().upper() for p in os.getenv(
     "PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
 ).split(",") if p.strip()]
@@ -56,6 +56,7 @@ PORT = int(os.getenv("PORT", "8080"))
 # ================== STATE ==================
 state: Dict[str, Any] = {
     "equity": START_BALANCE,
+    "last_equity": START_BALANCE,   # для расчёта Δ за сделку
     "high_water": START_BALANCE,
     "pairs": {
         p: {
@@ -250,9 +251,13 @@ async def pair_loop(app: Application, pair: str):
                 hit_sl = (last <= sl) if side == "LONG" else (last >= sl)
 
                 if hit_tp or hit_sl:
+                    # баланс до закрытия
+                    prev_equity = state["equity"]
+
                     pnl = simulate_close(side, entry, last, qty)
                     pr["pos"] = None
 
+                    # stats
                     st = pr["stats"]
                     st["trades"] += 1
                     st["pnl"] += pnl
@@ -261,9 +266,17 @@ async def pair_loop(app: Application, pair: str):
                     else:
                         st["losses"] += 1
 
+                    # обновляем общий баланс
                     state["equity"] += pnl
                     state["high_water"] = max(state["high_water"], state["equity"])
 
+                    # Δ за сделку и % к предыдущему балансу
+                    delta = state["equity"] - prev_equity
+                    delta_pct = (delta / prev_equity * 100.0) if prev_equity > 0 else 0.0
+                    # % к стартовому балансу
+                    total_pct = (state["equity"] / START_BALANCE - 1.0) * 100.0
+
+                    # winrates
                     wr_pair = 100.0 * st["wins"] / st["trades"] if st["trades"] else 0.0
                     tot_trades = sum(state["pairs"][p]["stats"]["trades"] for p in PAIRS)
                     tot_wins = sum(state["pairs"][p]["stats"]["wins"] for p in PAIRS)
@@ -278,9 +291,13 @@ async def pair_loop(app: Application, pair: str):
                         f"\n• PnL: {'+' if pnl>=0 else ''}{fmt(pnl,5)}"
                         f"\n• pair stats: trades {st['trades']}, WR {fmt(wr_pair,2)}%, PnL {fmt(st['pnl'],5)}"
                         f"\n• total: trades {tot_trades}, WR {fmt(wr_tot,2)}%, PnL {fmt(tot_pnl,5)}"
-                        f"\n• equity: {fmt(state['equity'],5)} (lev {LEVERAGE}×, fee {FEE_PCT*100:.3f}%)"
+                        f"\n• balance: {fmt(state['equity'],5)}  (Δ {'+' if delta>=0 else ''}{fmt(delta,5)} | {fmt(delta_pct,2)}%)"
+                        f"\n• since start: {fmt(total_pct,2)}%   (lev {LEVERAGE}×, fee {FEE_PCT*100:.3f}%)"
                     )
                     await tg_send(app, txt)
+
+                    # запоминаем последний equity после сделки
+                    state["last_equity"] = state["equity"]
 
             # ---- open new position
             can_open = (sig != "FLAT") and (pr["pos"] is None)
@@ -315,6 +332,7 @@ async def pair_loop(app: Application, pair: str):
                         )
                         await tg_send(app, txt)
 
+            # отладка по запросу
             if DEBUG_TELEMETRY:
                 pr_open = pr["pos"]
                 patt_name = ", ".join([k for k, v in patterns(df).items() if v]) or "—"
@@ -344,9 +362,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{p}• trades: {tr}  WR: {fmt(wr,2)}%  PnL: {fmt(pnl,5)}\npos: {pos_str}")
         tot_tr += tr; tot_w += w; tot_pnl += pnl
     wr_tot = 100.0 * tot_w / tot_tr if tot_tr else 0.0
+    total_pct = (state["equity"] / START_BALANCE - 1.0) * 100.0
     lines.append("—")
     lines.append(f"TOTAL • trades: {tot_tr}  WR: {fmt(wr_tot,2)}%  PnL: {fmt(tot_pnl,5)}")
-    lines.append(f"equity: {fmt(state['equity'],5)}  leverage: {LEVERAGE}×  fee: {FEE_PCT*100:.3f}%")
+    lines.append(f"equity: {fmt(state['equity'],5)}  ({fmt(total_pct,2)}% с начала)  leverage: {LEVERAGE}×  fee: {FEE_PCT*100:.3f}%")
     await update.effective_chat.send_message("\n".join(lines), parse_mode=ParseMode.HTML)
 
 # ================== APP ==================
@@ -396,9 +415,9 @@ def main():
             app.run_webhook(
                 listen=listen_addr,
                 port=listen_port,
-                url_path=WEBHOOK_PATH,  # путь для приема апдейтов
+                url_path=WEBHOOK_PATH,
                 drop_pending_updates=True,
-                stop_signals=None,  # управляем завершением контейнером
+                stop_signals=None,
             )
         except Exception as e:
             logger.exception(f"run_webhook failed: {e}")
