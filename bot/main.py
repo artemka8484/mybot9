@@ -1,16 +1,15 @@
-# bot/main.py
-# Универсальный запуск: поддержка python-telegram-bot v13.x и v20+
-import os
-import logging
-from datetime import datetime
-from threading import RLock
-import time
-
-import numpy as np
-import pandas as pd
+# -*- coding: utf-8 -*-
+import os, json, time, math, threading, socketserver, http.server
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple
 import requests
+import logging
+from collections import deque
 
-# ────────────────────────── LOGGING ──────────────────────────
+from telegram import ParseMode, Bot
+from telegram.ext import Updater, CommandHandler
+
+# --------------------------- logging ---------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -18,298 +17,336 @@ logging.basicConfig(
 )
 log = logging.getLogger("mybot9")
 
-# ─────────────────────── ENV / CONFIG ────────────────────────
-TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-
-MEXC_BASE_URL = os.getenv("MEXC_BASE_URL", "https://contract.mexc.com")
-PAIRS = [x.strip() for x in os.getenv("PAIRS", "BTCUSDT,ETHUSDT").split(",") if x.strip()]
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-
-RISK_PCT = float(os.getenv("RISK_PCT", "1"))
-TP_PCT = float(os.getenv("TP_PCT", "0.35"))
-ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "1"))
-EMA_LEN = int(os.getenv("EMA_LEN", "100"))
-EMA_SLOPE_BARS = int(os.getenv("EMA_SLOPE_BARS", "8"))
-LEVERAGE = float(os.getenv("LEVERAGE", "5"))
-FEE_PCT = float(os.getenv("FEE_PCT", "0.0006"))
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "240"))
-
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
-START_BALANCE = float(os.getenv("DEMO_START_BALANCE", "5000"))
-
-if not TOKEN or not CHAT_ID:
-    raise SystemExit("TELEGRAM_TOKEN и TELEGRAM_CHAT_ID обязательны")
-
-# ──────────────── STATE (в памяти процесса) ──────────────────
-positions = {}  # pair -> {dir, entry, tp, sl, qty}
-balance = START_BALANCE
-stats = {p: {"trades": 0, "wins": 0, "pnl": 0.0} for p in PAIRS}
-_started = set()
-lock = RLock()
-
-# ────────────────────── MARKET HELPERS ───────────────────────
-def get_candles(symbol: str, limit: int = 200) -> pd.DataFrame | None:
-    url = f"{MEXC_BASE_URL}/api/v1/contract/kline/{symbol}"
-    params = {"interval": TIMEFRAME, "limit": limit}
+# --------------------------- env -------------------------------------
+def envf(name, default=None, cast=str):
+    v = os.getenv(name, default)
+    if v is None: return None
     try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        for c in ("open", "high", "low", "close"):
-            df[c] = df[c].astype(float)
-        return df
-    except Exception as e:
-        log.warning(f"{symbol} get_candles error: {e}")
-        return None
+        return cast(v) if cast else v
+    except Exception:
+        return v
 
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    tr = np.maximum(hl, np.maximum(hc, lc))
-    return tr.rolling(n).mean()
+TELEGRAM_TOKEN = envf("TELEGRAM_TOKEN")
+CHAT_ID        = envf("TELEGRAM_CHAT_ID")
+assert TELEGRAM_TOKEN and CHAT_ID, "TELEGRAM_TOKEN и TELEGRAM_CHAT_ID обязательны"
 
-def ema(df: pd.DataFrame, n: int) -> pd.Series:
-    return df["close"].ewm(span=n, adjust=False).mean()
+MODE        = envf("MODE", "DEMO")
+DEMO        = str(envf("DEMO_MODE", "true")).lower() == "true"
+START_BAL   = float(envf("DEMO_START_BALANCE", 5000, float))
+DRY_RUN     = str(envf("DRY_RUN", "false")).lower() == "true"
 
-def analyze_signal(df: pd.DataFrame):
-    if len(df) < EMA_LEN + EMA_SLOPE_BARS + 2:
-        return None
-    df = df.copy()
-    df["ema"] = ema(df, EMA_LEN)
-    slope = df["ema"].iloc[-1] - df["ema"].iloc[-EMA_SLOPE_BARS]
+PAIRS = [p.strip().upper() for p in envf("PAIRS", "BTCUSDT,ETHUSDT").split(",") if p.strip()]
+TF    = envf("TIMEFRAME", "5m")
+RISK  = float(envf("RISK_PCT", 1.0, float)) / 100.0
+LEV   = float(envf("LEVERAGE", 5, float))
+FEE   = float(envf("FEE_PCT", 0.0006, float))
+TP_P  = float(envf("TP_PCT", 0.35, float)) / 100.0
 
-    last = df.iloc[-1]
-    body = abs(last["close"] - last["open"])
-    rng = last["high"] - last["low"]
-    atr_val = atr(df, ATR_LEN).iloc[-1]
-    if rng <= 0 or np.isnan(atr_val):
-        return None
+ATR_LEN  = int(envf("ATR_LEN", 14, int))
+ATR_K    = float(envf("ATR_MULT_SL", 1.0, float))
+EMA_LEN  = int(envf("EMA_LEN", 100, int))
+SLOPE_N  = int(envf("EMA_SLOPE_BARS", 8, int))
+COOLDOWN = int(envf("COOLDOWN_SEC", 240, int))
 
-    shadow_ratio = rng / max(body, 1e-9)
-    if body < atr_val * 0.25 and shadow_ratio > 2:
-        direction = "LONG" if last["close"] > last["open"] else "SHORT"
-        return ("hammer", direction, float(slope), float(atr_val))
-    return None
+USE_WEBHOOK = str(envf("USE_WEBHOOK", "0")).lower() in ("1","true","yes")
 
-def _qty_from_risk(entry: float, sl: float) -> float:
-    risk_usd = balance * (RISK_PCT / 100.0)
-    per_unit = abs(entry - sl)
-    if per_unit <= 0:
-        return 0.0
-    return risk_usd / per_unit
+MEXC_URL = envf("MEXC_BASE_URL", "https://contract.mexc.com")
 
-# ─────────────────────── CORE ACTIONS ────────────────────────
-def _open_trade(pair: str, bot_send):
-    global positions
-    df = get_candles(pair, 200)
-    if df is None:
-        return
-    sig = analyze_signal(df)
-    if not sig:
-        return
+# --------------------------- time ------------------------------------
+TZ = timezone.utc
+def now_utc(): return datetime.now(TZ)
 
-    name, direction, slope, atr_val = sig
-    entry = float(df["close"].iloc[-1])
+# --------------------------- state & persistence ----------------------
+STATE_FILE = "state.json"
+state_lock = threading.Lock()
 
-    if direction == "LONG":
-        tp = entry * (1 + TP_PCT / 100.0)
-        sl = entry - ATR_MULT_SL * atr_val
-    else:
-        tp = entry * (1 - TP_PCT / 100.0)
-        sl = entry + ATR_MULT_SL * atr_val
+balance = START_BAL
+positions: Dict[str, Dict] = {}       # pair -> dict(entry, qty, tp, sl, side, opened_at, reason)
+stats = {
+    "pairs": {p: {"trades": 0, "wins": 0, "pnl": 0.0} for p in PAIRS},
+    "total": {"trades": 0, "wins": 0, "pnl": 0.0}
+}
 
-    qty = _qty_from_risk(entry, sl)
-    if qty <= 0:
-        return
-
-    positions[pair] = {"dir": direction, "entry": entry, "tp": float(tp), "sl": float(sl), "qty": float(qty)}
-
-    msg = (
-        f"🔴 OPEN {pair} {direction}\n"
-        f"• time: {datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC\n"
-        f"• entry: {entry:.5f}\n"
-        f"• qty: {qty:.5f}\n"
-        f"• TP: {tp:.5f}   SL: {sl:.5f}\n"
-        f"• signal: {name}, slope {slope:.5f}, ATR {atr_val:.5f}\n"
-        f"• mode: {'DEMO' if DEMO_MODE else 'LIVE'}"
-    )
-    bot_send(msg)
-
-def _check_positions(bot_send_price, bot_send_msg):
-    """bot_send_price(pair)->last_price, bot_send_msg(text) -> send."""
+def load_state():
     global balance, positions, stats
-    with lock:
-        for pair, pos in list(positions.items()):
-            price = bot_send_price(pair)
-            if price is None:
-                continue
-            closed = False
-            pnl = 0.0
-            if pos["dir"] == "LONG":
-                if price >= pos["tp"]:
-                    pnl = (pos["tp"] - pos["entry"]) * pos["qty"]
-                    closed = True
-                elif price <= pos["sl"]:
-                    pnl = (pos["sl"] - pos["entry"]) * pos["qty"]
-                    closed = True
-            else:
-                if price <= pos["tp"]:
-                    pnl = (pos["entry"] - pos["tp"]) * pos["qty"]
-                    closed = True
-                elif price >= pos["sl"]:
-                    pnl = (pos["entry"] - pos["sl"]) * pos["qty"]
-                    closed = True
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        balance = float(data.get("balance", START_BAL))
+        positions.update(data.get("positions", {}))
+        saved = data.get("stats", {})
+        if saved:
+            stats["pairs"].update(saved.get("pairs", {}))
+            stats["total"].update(saved.get("total", {}))
+        log.info(f"State loaded: balance={balance:.2f}, open={list(positions.keys())}")
+    except FileNotFoundError:
+        log.info("No previous state file found.")
+    except Exception as e:
+        log.warning(f"Failed to load state: {e}")
 
-            if closed:
-                balance += pnl
-                s = stats[pair]
-                s["trades"] += 1
-                s["pnl"] += pnl
-                if pnl > 0:
-                    s["wins"] += 1
-                label = "TP" if pnl > 0 else "SL"
-                result = "✅ CLOSE" if pnl > 0 else "❌ CLOSE"
-                bot_send_msg(
-                    f"{result} {pair} ({label})\n"
-                    f"• time: {datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC\n"
-                    f"• exit: {price:.5f}\n"
-                    f"• PnL: {pnl:.5f}\n"
-                    f"• equity: {balance:.2f}  (lev {LEVERAGE:.1f}x, fee {FEE_PCT*100:.3f}%)"
-                )
-                del positions[pair]
+def save_state():
+    try:
+        payload = {"balance": balance, "positions": positions, "stats": stats}
+        with open(STATE_FILE, "w") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        log.warning(f"Failed to save state: {e}")
 
-def _status_text() -> str:
-    total_tr = sum(s["trades"] for s in stats.values())
-    total_win = sum(s["wins"] for s in stats.values())
-    wr = (total_win / total_tr * 100) if total_tr else 0.0
-    total_pnl = sum(s["pnl"] for s in stats.values())
-    lines = [f"📊 STATUS {datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC"]
+# --------------------------- health HTTP (koyeb) ----------------------
+class Quiet(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args, **kwargs): pass
+
+def serve_health():
+    PORT = 8080
+    try:
+        with socketserver.TCPServer(("0.0.0.0", PORT), Quiet) as httpd:
+            httpd.serve_forever()
+    except OSError as e:
+        log.warning(f"Health server bind skipped: {e}")
+
+threading.Thread(target=serve_health, daemon=True).start()
+
+# --------------------------- market data ------------------------------
+session = requests.Session()
+session.headers.update({"User-Agent": "mybot9/1.0"})
+
+INTERVAL_MAP = {
+    "1m":"Min1", "3m":"Min3", "5m":"Min5", "15m":"Min15", "30m":"Min30",
+    "1h":"Hour1", "4h":"Hour4", "1d":"Day1"
+}
+def kline_interval(tf: str) -> str:
+    return INTERVAL_MAP.get(tf, "Min5")
+
+def fetch_klines(pair: str, limit=EMA_LEN+ATR_LEN+SLOPE_N+5) -> List[Tuple[float,float,float,float]]:
+    """
+    returns list of tuples (ts, open, high, low, close)
+    """
+    url = f"{MEXC_URL}/api/v1/contract/kline/{pair}"
+    params = {"interval": kline_interval(TF), "limit": limit}
+    r = session.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    kl = []
+    for it in data.get("data", []):
+        ts = int(it["t"]) / 1000
+        o,h,l,c = map(float, (it["o"], it["h"], it["l"], it["c"]))
+        kl.append((ts,o,h,l,c))
+    if not kl:
+        raise RuntimeError(f"no klines for {pair}")
+    return kl
+
+# --------------------------- indicators --------------------------------
+def ema(values: List[float], length: int) -> float:
+    k = 2/(length+1)
+    e = values[0]
+    for v in values[1:]:
+        e = v*k + e*(1-k)
+    return e
+
+def atr(ohlc: List[Tuple[float,float,float,float,float]], length: int) -> float:
+    trs = []
+    prev_close = ohlc[0][4]
+    for (_,o,h,l,c) in ohlc[1:]:
+        tr = max(h-l, abs(h-prev_close), abs(l-prev_close))
+        trs.append(tr)
+        prev_close = c
+    if len(trs) < length: length = len(trs)
+    return sum(trs[-length:])/length if length>0 else 0.0
+
+def ema_slope(closes: List[float], length:int, bars:int) -> float:
+    if len(closes) < length+bars: return 0.0
+    e2 = ema(closes[-length:], length)
+    e1 = ema(closes[-length-bars:-bars], length)
+    return (e2 - e1) / max(1e-9, e1)
+
+def detect_signal(ohlc) -> Tuple[str, str]:
+    """
+    простая логика: молот/перевёрнутый молот + направление EMA-наклона
+    возвращает (side, reason) — side in {"LONG","SHORT",None}
+    """
+    *_, (t,o,h,l,c) = ohlc
+    body = abs(c - o)
+    upper = h - max(o,c)
+    lower = min(o,c) - l
+    is_hammer = lower > body*2 and upper < body
+    is_shoot  = upper > body*2 and lower < body
+
+    closes = [x[4] for x in ohlc]
+    slope = ema_slope(closes, EMA_LEN, SLOPE_N)
+
+    if is_hammer and slope >= 0:
+        return "LONG", f"hammer, slope {slope:.5f}"
+    if is_shoot and slope <= 0:
+        return "SHORT", f"hammer, slope {slope:.5f}"  # «hammer» для коротких — перевёрнутый
+    return None, f"slope {slope:.5f}"
+
+# --------------------------- trading engine ----------------------------
+last_trade_time: Dict[str, float] = {p: 0.0 for p in PAIRS}
+
+def position_size(balance_usdt: float, price: float) -> float:
+    risk_capital = balance_usdt * RISK
+    notional = risk_capital * LEV
+    qty = max(1e-8, notional / price)
+    return qty
+
+def open_position(pair: str, side: str, price: float, atr_val: float, reason: str):
+    global balance
+    if positions.get(pair):
+        return
+
+    # cooldown
+    if time.time() - last_trade_time.get(pair, 0) < COOLDOWN:
+        return
+    last_trade_time[pair] = time.time()
+
+    qty = position_size(balance, price)
+    tp = price * (1 + TP_P) if side == "LONG" else price * (1 - TP_P)
+    sl_off = ATR_K * atr_val
+    sl = price - sl_off if side == "LONG" else price + sl_off
+
+    positions[pair] = {
+        "side": side, "entry": price, "qty": qty,
+        "tp": tp, "sl": sl, "opened_at": now_utc().isoformat(),
+        "reason": reason
+    }
+    save_state()
+    send_open(pair, side, price, qty, tp, sl, reason)
+
+def check_positions(pair: str, last_price: float):
+    global balance, stats
+    pos = positions.get(pair)
+    if not pos: return
+    side = pos["side"]
+    entry, qty, tp, sl = pos["entry"], pos["qty"], pos["tp"], pos["sl"]
+
+    hit_tp = last_price >= tp if side == "LONG" else last_price <= tp
+    hit_sl = last_price <= sl if side == "LONG" else last_price >= sl
+    if not (hit_tp or hit_sl):
+        return
+
+    # close
+    exit_price = tp if hit_tp else sl
+    pnl_notional = (exit_price - entry) * qty * (1 if side=="LONG" else -1)
+    fee_cost = (entry + exit_price) * qty * FEE
+    pnl = pnl_notional - fee_cost
+    balance += pnl
+
+    # stats
+    s = stats["pairs"][pair]
+    s["trades"] += 1
+    s["pnl"] += pnl
+    if pnl > 0: s["wins"] += 1
+    stats["total"]["trades"] += 1
+    stats["total"]["pnl"] += pnl
+    if pnl > 0: stats["total"]["wins"] += 1
+
+    # message
+    send_close(pair, exit_price, pnl, hit_tp)
+
+    # remove
+    del positions[pair]
+    save_state()
+
+# --------------------------- telegram ---------------------------------
+bot = Bot(token=TELEGRAM_TOKEN)
+updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+dp = updater.dispatcher
+
+def human_pair_stat(pair: str) -> str:
+    s = stats["pairs"][pair]
+    wr = (s["wins"]/s["trades"]*100) if s["trades"] else 0.0
+    pnl = s["pnl"]
+    pos = positions.get(pair)
+    pos_line = "—"
+    if pos:
+        pos_line = f"{pos['qty']:.6f}  pos: <b>{pos['side']}</b> @ {pos['entry']:.5f} (TP {pos['tp']:.5f} / SL {pos['sl']:.5f})"
+    return (f"{pair} • trades: {s['trades']}  WR: {wr:.2f}%  PnL: {pnl:.5f}\n"
+            f"{pos_line}")
+
+def cmd_start(update, ctx):
+    msg = (f"🤖 mybot9 started (v13)\n"
+           f"Mode: {MODE} | Risk {RISK*100:.1f}% | TF {TF} | Tick {COOLDOWN}s\n"
+           f"Pairs: {', '.join(PAIRS)} | Balance: {balance:.2f} USDT")
+    ctx.bot.send_message(CHAT_ID, msg)
+
+def cmd_status(update, ctx):
+    lines = [f"📊 STATUS {now_utc():%Y-%m-%d %H:%M:%S} UTC"]
     for p in PAIRS:
-        s = stats[p]
-        pair_wr = (s["wins"]/s["trades"]*100) if s["trades"] else 0.0
-        lines.append(f"{p} • trades: {s['trades']}  WR: {pair_wr:.2f}%  PnL: {s['pnl']:.5f}")
-    if positions:
-        for p, pos in positions.items():
-            lines.append(f"{p} • pos: {pos['dir']} @ {pos['entry']:.5f} (TP {pos['tp']:.5f} / SL {pos['sl']:.5f})")
-    else:
+        lines.append(human_pair_stat(p))
         lines.append("—")
-    lines.append("—")
-    lines.append(f"TOTAL • trades: {total_tr}  WR: {wr:.2f}%  PnL: {total_pnl:.5f}")
+    tot = stats["total"]
+    wr = (tot["wins"]/tot["trades"]*100) if tot["trades"] else 0.0
+    lines.append(f"TOTAL • trades: {tot['trades']}  WR: {wr:.2f}%  PnL: {tot['pnl']:.5f}")
     lines.append(f"equity: {balance:.2f}")
-    lines.append(f"leverage: {LEVERAGE:.1f}x  fee: {FEE_PCT*100:.3f}%")
-    return "\n".join(lines)
+    lines.append(f"leverage: {LEV:.1f}x  fee: {FEE*100:.3f}%")
+    ctx.bot.send_message(CHAT_ID, "\n".join(lines), parse_mode=ParseMode.HTML)
 
-# ────────────────────── COMPAT LAYER ─────────────────────────
-def _price_now(pair: str) -> float | None:
-    df = get_candles(pair, 3)
-    if df is None:
-        return None
-    return float(df["close"].iloc[-1])
+dp.add_handler(CommandHandler("start", cmd_start))
+dp.add_handler(CommandHandler("status", cmd_status))
 
-# Попытка импортировать API v20+
-try:
-    from telegram import Update
-    from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+def send_open(pair, side, entry, qty, tp, sl, reason):
+    text = (f"🔴 OPEN {pair} {side}\n"
+            f"• time: {now_utc():%Y-%m-%d %H:%M:%S} UTC\n"
+            f"• entry: {entry:.5f}\n"
+            f"• qty: {qty:.6f}\n"
+            f"• TP: {tp:.5f}   SL: {sl:.5f}\n"
+            f"• signal: {reason}\n"
+            f"• mode: {MODE}")
+    bot.send_message(chat_id=CHAT_ID, text=text)
 
-    USE_V20 = True
-except Exception:
-    USE_V20 = False
+def send_close(pair, exit_price, pnl, is_tp):
+    s = stats["pairs"][pair]
+    tot = stats["total"]
+    text = (f"{'✅' if is_tp else '❌'} CLOSE {pair} ({'TP' if is_tp else 'SL'})\n"
+            f"• time: {now_utc():%Y-%m-%d %H:%M:%S} UTC\n"
+            f"• exit: {exit_price:.5f}\n"
+            f"• PnL: {pnl:+.5f}\n"
+            f"• pair stats: trades {s['trades']}, WR {(s['wins']/s['trades']*100 if s['trades'] else 0):.2f}%, PnL {s['pnl']:+.5f}\n"
+            f"• total: trades {tot['trades']}, WR {(tot['wins']/tot['trades']*100 if tot['trades'] else 0):.2f}%, PnL {tot['pnl']:+.5f}\n"
+            f"• balance: {balance:.5f}")
+    bot.send_message(chat_id=CHAT_ID, text=text)
 
-# ───────────────────────── v20+ path ─────────────────────────
-if USE_V20:
-    import asyncio
+# --------------------------- main loop --------------------------------
+def loop_pair(pair: str):
+    try:
+        ohlc = fetch_klines(pair)
+        atr_v = atr(ohlc[-(ATR_LEN+1):], ATR_LEN)
+        side, reason = detect_signal(ohlc)
+        last_close = ohlc[-1][4]
 
-    async def _send(ctx: ContextTypes.DEFAULT_TYPE, text: str):
-        await ctx.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+        # manage open
+        check_positions(pair, last_close)
 
-    async def loop_job(ctx: ContextTypes.DEFAULT_TYPE):
-        pair = ctx.job.data
-        if pair not in _started:
-            _started.add(pair)
-            await _send(ctx, f"✅ Loop started for <b>{pair}</b>")
-        # check
-        _check_positions(_price_now, lambda t: asyncio.create_task(_send(ctx, t)))
-        # open if flat
-        if pair not in positions:
-            _open_trade(pair, lambda t: asyncio.create_task(_send(ctx, t)))
+        # open if no position
+        if side and pair not in positions:
+            open_position(pair, side, last_close, atr_v, reason)
 
-    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await _send(context, _status_text())
+    except Exception as e:
+        log.warning(f"{pair} loop error: {e}")
 
-    async def on_start(app):
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-        for p in PAIRS:
-            app.job_queue.run_repeating(loop_job, interval=COOLDOWN_SEC, first=1, data=p, name=f"loop-{p}")
-        await app.bot.send_message(
-            chat_id=CHAT_ID,
-            text=(f"🤖 mybot9 started (v20)\nMode: {'DEMO' if DEMO_MODE else 'LIVE'} | "
-                  f"Risk {RISK_PCT:.1f}% | TF {TIMEFRAME} | Tick {COOLDOWN_SEC}s\n"
-                  f"Pairs: {', '.join(PAIRS)} | Balance: {START_BALANCE:.0f} USDT")
-        )
+# --------------------------- scheduler --------------------------------
+from apscheduler.schedulers.background import BackgroundScheduler
 
-    def main():
-        app = ApplicationBuilder().token(TOKEN).build()
-        app.add_handler(CommandHandler("status", cmd_status))
-        app.post_init = on_start
-        app.run_polling(close_loop=False)
+def main():
+    load_state()
+    log.info(f"Mode {MODE} demo={DEMO} dry={DRY_RUN}  pairs={PAIRS} tf={TF}  "
+             f"risk={RISK*100:.1f}% tp={TP_P*100:.3f}% atr_len={ATR_LEN} atr_mult={ATR_K} ema={EMA_LEN}/{SLOPE_N}")
 
-# ───────────────────────── v13.x path ────────────────────────
-else:
-    # Старый синхронный API
-    from telegram.ext import Updater, CommandHandler, CallbackContext
+    # старт polling (без вебхука, чтобы не ловить конфликт портов)
+    updater.start_polling(clean=True)
 
-    def _send_sync(context: CallbackContext, text: str):
-        context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+    # работающий jobs
+    sched = BackgroundScheduler(timezone=TZ)
+    for p in PAIRS:
+        # интервал чуть чаще TF, но сдвинут чтобы не ловить сырую свечу
+        sched.add_job(lambda pair=p: loop_pair(pair), "interval", seconds=COOLDOWN, id=f"loop-{p}")
+        bot.send_message(CHAT_ID, f"✅ Loop started for <b>{p}</b>", parse_mode=ParseMode.HTML)
+    sched.start()
+    log.info("Scheduler started")
 
-    def loop_job_sync(context: CallbackContext):
-        pair = context.job.context
-        if pair not in _started:
-            _started.add(pair)
-            _send_sync(context, f"✅ Loop started for <b>{pair}</b>")
-        _check_positions(_price_now, lambda t: _send_sync(context, t))
-        if pair not in positions:
-            _open_trade(pair, lambda t: _send_sync(context, t))
+    updater.idle()
+    # при стопе сохраним
+    save_state()
 
-    def cmd_status_sync(update, context: CallbackContext):
-        _send_sync(context, _status_text())
-
-    def main():
-        # В v13 НЕЛЬЗЯ передавать параметр 'request' → используем по умолчанию
-        updater = Updater(token=TOKEN, use_context=True)
-        dp = updater.dispatcher
-        dp.add_handler(CommandHandler("status", cmd_status_sync))
-
-        # убрать вебхук на случай прошлых запусков
-        try:
-            updater.bot.delete_webhook()
-        except Exception:
-            pass
-
-        # Планируем задачи
-        for p in PAIRS:
-            updater.job_queue.run_repeating(
-                loop_job_sync, interval=COOLDOWN_SEC, first=1, context=p, name=f"loop-{p}"
-            )
-
-        # старт
-        updater.bot.send_message(
-            chat_id=CHAT_ID,
-            text=(f"🤖 mybot9 started (v13)\nMode: {'DEMO' if DEMO_MODE else 'LIVE'} | "
-                  f"Risk {RISK_PCT:.1f}% | TF {TIMEFRAME} | Tick {COOLDOWN_SEC}s\n"
-                  f"Pairs: {', '.join(PAIRS)} | Balance: {START_BALANCE:.0f} USDT")
-        )
-        updater.start_polling(clean=True)
-        updater.idle()
-
-# ──────────────────────────── RUN ────────────────────────────
 if __name__ == "__main__":
     main()
