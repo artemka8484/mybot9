@@ -1,352 +1,519 @@
 # -*- coding: utf-8 -*-
-import os, json, time, math, threading, socketserver, http.server
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple
-import requests
+"""
+Единый стабильный бот-торговец (v13 ptb).
+- По умолчанию POLLING. Webhook можно включить через USE_WEBHOOK=1.
+- Health server (8080) стартует только в POLLING и только если HEALTH_SERVER=1.
+- Источник kline: Binance public API (без ключей).
+- Стратегия: EMA + slope, ATR SL/TP, свечи: hammer, engulf, breakout.
+- Комиссия учитывается, риск на сделку, cooldown между входами.
+"""
+import os
+import time
+import json
+import threading
 import logging
-from collections import deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timedelta, timezone
+from math import copysign
 
-from telegram import ParseMode, Bot
-from telegram.ext import Updater, CommandHandler
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
-# --------------------------- logging ---------------------------------
+from telegram import Bot, ParseMode
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+)
+from telegram.error import Conflict
+
+# ------------- LOGGING -------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger("mybot9")
 
-# --------------------------- env -------------------------------------
-def envf(name, default=None, cast=str):
-    v = os.getenv(name, default)
-    if v is None: return None
+# ------------- ENV -------------
+def env_str(name, default=None):
+    v = os.getenv(name)
+    return v if v is not None else default
+
+def env_int(name, default):
     try:
-        return cast(v) if cast else v
+        return int(os.getenv(name, default))
     except Exception:
-        return v
+        return default
 
-TELEGRAM_TOKEN = envf("TELEGRAM_TOKEN")
-CHAT_ID        = envf("TELEGRAM_CHAT_ID")
-assert TELEGRAM_TOKEN and CHAT_ID, "TELEGRAM_TOKEN и TELEGRAM_CHAT_ID обязательны"
+def env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return default
 
-MODE        = envf("MODE", "DEMO")
-DEMO        = str(envf("DEMO_MODE", "true")).lower() == "true"
-START_BAL   = float(envf("DEMO_START_BALANCE", 5000, float))
-DRY_RUN     = str(envf("DRY_RUN", "false")).lower() == "true"
+# Telegram / run
+TELEGRAM_TOKEN  = env_str("TELEGRAM_TOKEN")
+CHAT_ID         = env_str("TELEGRAM_CHAT_ID")
+USE_WEBHOOK     = env_int("USE_WEBHOOK", 0) == 1
+PUBLIC_URL      = env_str("PUBLIC_URL")  # обязательно для webhook
+WEBHOOK_SECRET  = env_str("WEBHOOK_SECRET", "hook")
+PORT            = env_int("PORT", 8080)
+HEALTH_SERVER   = env_int("HEALTH_SERVER", 1)  # только для polling
+TZ_NAME         = env_str("TX", "UTC")
 
-PAIRS = [p.strip().upper() for p in envf("PAIRS", "BTCUSDT,ETHUSDT").split(",") if p.strip()]
-TF    = envf("TIMEFRAME", "5m")
-RISK  = float(envf("RISK_PCT", 1.0, float)) / 100.0
-LEV   = float(envf("LEVERAGE", 5, float))
-FEE   = float(envf("FEE_PCT", 0.0006, float))
-TP_P  = float(envf("TP_PCT", 0.35, float)) / 100.0
+# Trade / strategy
+PAIRS           = [s.strip().upper() for s in env_str("PAIRS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
+TIMEFRAME       = env_str("TIMEFRAME", "5m")   # поддержка 1m/3m/5m/15m/30m/1h
+EMA_LEN         = env_int("EMA_LEN", 100)
+EMA_SLOPE_BARS  = env_int("EMA_SLOPE_BARS", 8)
+ATR_LEN         = env_int("ATR_LEN", 14)
+ATR_MULT_SL     = env_float("ATR_MULT_SL", 1.0)
+TP_PCT          = env_float("TP_PCT", 0.35) / 100.0  # 0.35% -> 0.0035
+RISK_PCT        = env_float("RISK_PCT", 1.0) / 100.0
+LEVERAGE        = env_float("LEVERAGE", 5.0)
+FEE_PCT         = env_float("FEE_PCT", 0.0006)  # 0.06%
+COOLDOWN_SEC    = env_int("COOLDOWN_SEC", 240)
+DEMO_MODE       = env_str("MODE", "DEMO").upper() == "DEMO" or env_str("DEMO_MODE", "true").lower() == "true"
+DEMO_START_BAL  = env_float("DEMO_START_BALANCE", 5000.0)
+TICK_SEC        = env_int("TICK_SEC", COOLDOWN_SEC)  # как часто работать циклу
 
-ATR_LEN  = int(envf("ATR_LEN", 14, int))
-ATR_K    = float(envf("ATR_MULT_SL", 1.0, float))
-EMA_LEN  = int(envf("EMA_LEN", 100, int))
-SLOPE_N  = int(envf("EMA_SLOPE_BARS", 8, int))
-COOLDOWN = int(envf("COOLDOWN_SEC", 240, int))
+# ------------- TIMEZONE -------------
+try:
+    tz = timezone.utc if TZ_NAME.upper() == "UTC" else timezone(timedelta(0))
+except Exception:
+    tz = timezone.utc
 
-USE_WEBHOOK = str(envf("USE_WEBHOOK", "0")).lower() in ("1","true","yes")
+# ------------- GLOBAL STATE -------------
+session = requests.Session()
+session.headers.update({"User-Agent": "mybot9/1.0"})
+# binance endpoints
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines?symbol={sym}&interval={itv}&limit={lim}"
 
-MEXC_URL = envf("MEXC_BASE_URL", "https://contract.mexc.com")
-
-# --------------------------- time ------------------------------------
-TZ = timezone.utc
-def now_utc(): return datetime.now(TZ)
-
-# --------------------------- state & persistence ----------------------
-STATE_FILE = "state.json"
 state_lock = threading.Lock()
 
-balance = START_BAL
-positions: Dict[str, Dict] = {}       # pair -> dict(entry, qty, tp, sl, side, opened_at, reason)
-stats = {
-    "pairs": {p: {"trades": 0, "wins": 0, "pnl": 0.0} for p in PAIRS},
-    "total": {"trades": 0, "wins": 0, "pnl": 0.0}
+state = {
+    "equity": DEMO_START_BAL,
+    "pairs": {},      # symbol -> dict with pos/stats/last_ts/...
+    "started": datetime.now(tz=tz),
+    "version": "v13"
 }
+for p in PAIRS:
+    state["pairs"][p] = {
+        "pos": None,          # dict | None
+        "trades": 0,
+        "wins": 0,
+        "pnl": 0.0,
+        "last_signal_ts": 0.0
+    }
 
-def load_state():
-    global balance, positions, stats
+# ------------- UTILS -------------
+def fmt(n, prec=5):
     try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-        balance = float(data.get("balance", START_BAL))
-        positions.update(data.get("positions", {}))
-        saved = data.get("stats", {})
-        if saved:
-            stats["pairs"].update(saved.get("pairs", {}))
-            stats["total"].update(saved.get("total", {}))
-        log.info(f"State loaded: balance={balance:.2f}, open={list(positions.keys())}")
-    except FileNotFoundError:
-        log.info("No previous state file found.")
+        return f"{float(n):.{prec}f}"
+    except Exception:
+        return str(n)
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def send(msg: str, parse=ParseMode.HTML):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        log.warning("TELEGRAM_TOKEN/CHAT_ID not set; skip send.")
+        return
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=parse, disable_web_page_preview=True)
     except Exception as e:
-        log.warning(f"Failed to load state: {e}")
+        log.error(f"send(): {e}")
 
-def save_state():
+# ------------- INDICATORS -------------
+def ema(values, length):
+    if not values or len(values) < length:
+        return []
+    k = 2 / (length + 1)
+    out = [sum(values[:length]) / length]
+    for v in values[length:]:
+        out.append(out[-1] + k * (v - out[-1]))
+    # подгон по длине входа
+    pad = [None] * (len(values) - len(out))
+    return pad + out
+
+def atr(h, l, c, length):
+    if len(c) < length + 1:
+        return []
+    trs = []
+    for i in range(1, len(c)):
+        tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+        trs.append(tr)
+    # простое RMA
+    rma = []
+    alpha = 1.0 / length
+    rma.append(sum(trs[:length]) / length)
+    for v in trs[length:]:
+        rma.append((1 - alpha) * rma[-1] + alpha * v)
+    # выравниваем
+    pad = [None] * (len(c) - len(rma) - 1)
+    return pad + rma
+
+def detect_hammer(o, h, l, c):
+    """Простой hammer: длинная тень снизу/сверху и маленькое тело."""
+    if len(c) < 2:
+        return 0
+    i = -2  # предыдущая свеча (закрытая)
+    body = abs(c[i] - o[i])
+    rng = h[i] - l[i]
+    if rng == 0:
+        return 0
+    lower = min(c[i], o[i]) - l[i]
+    upper = h[i] - max(c[i], o[i])
+    # тело маленькое, одна тень длинная
+    if body <= 0.3 * rng:
+        if lower >= 0.5 * rng:
+            return +1  # bullish hammer
+        if upper >= 0.5 * rng:
+            return -1  # bearish hammer (inverted)
+    return 0
+
+def detect_engulf(o, c):
+    """Bull/Bear engulf по двум последним закрытым свечам."""
+    if len(c) < 3:
+        return 0
+    i2, i1 = -3, -2
+    # бычье поглощение
+    if c[i2] < o[i2] and c[i1] > o[i1] and c[i1] >= o[i2] and o[i1] <= c[i2]:
+        return +1
+    # медвежье
+    if c[i2] > o[i2] and c[i1] < o[i1] and c[i1] <= o[i2] and o[i1] >= c[i2]:
+        return -1
+    return 0
+
+def detect_breakout(h, l, c, bars=20):
+    """Прорыв high/low за N баров (закрытая свеча)."""
+    if len(c) < bars + 2:
+        return 0
+    i = -2
+    hi = max(h[-bars-1:-1])
+    lo = min(l[-bars-1:-1])
+    if c[i] > hi:
+        return +1
+    if c[i] < lo:
+        return -1
+    return 0
+
+# ------------- DATA -------------
+def binance_interval(tf: str) -> str:
+    tf = tf.lower()
+    mapping = {"1m":"1m", "3m":"3m", "5m":"5m", "15m":"15m", "30m":"30m", "1h":"1h"}
+    return mapping.get(tf, "5m")
+
+def fetch_klines(symbol: str, limit=300):
+    url = BINANCE_KLINES.format(sym=symbol, itv=binance_interval(TIMEFRAME), lim=limit)
+    r = session.get(url, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    o, h, l, c = [], [], [], []
+    for k in data:
+        o.append(float(k[1])); h.append(float(k[2])); l.append(float(k[3])); c.append(float(k[4]))
+    return o, h, l, c
+
+# ------------- TRADING CORE -------------
+def compute_signal(o, h, l, c):
+    if len(c) < max(EMA_LEN + EMA_SLOPE_BARS, ATR_LEN) + 5:
+        return None
+    e = ema(c, EMA_LEN)
+    slope = None
+    if e[-EMA_SLOPE_BARS-1] is not None and e[-1] is not None:
+        slope = (e[-1] - e[-EMA_SLOPE_BARS-1]) / EMA_SLOPE_BARS
+
+    hammer = detect_hammer(o, h, l, c)
+    engulf = detect_engulf(o, c)
+    brk = detect_breakout(h, l, c, bars=20)
+
+    direction = 0
+    label = None
+    for sig, name in ((hammer, "hammer"), (engulf, "engulf"), (brk, "breakout")):
+        if sig != 0:
+            direction = sig
+            label = name
+            break
+
+    if direction == 0 or slope is None:
+        return None
+
+    # фильтр трендом EMA: берем сигнал только в сторону наклона EMA
+    if direction > 0 and slope <= 0:
+        return None
+    if direction < 0 and slope >= 0:
+        return None
+
+    atr_vals = atr(h, l, c, ATR_LEN)
+    if not atr_vals or atr_vals[-1] is None:
+        return None
+    return {
+        "dir": "LONG" if direction > 0 else "SHORT",
+        "entry": c[-1],
+        "atr": atr_vals[-1],
+        "slope": slope,
+        "label": label
+    }
+
+def open_position(sym: str, sig: dict):
+    with state_lock:
+        p = state["pairs"][sym]
+        if p["pos"] is not None:
+            return None  # уже в позиции
+        # риск на сделку в USDT
+        risk_cash = state["equity"] * RISK_PCT
+        # стоп размером ATR*mult → допустимая ден. потеря = risk_cash
+        # size в монетах (примерно): risk_cash / (ATR*mult) / price (на 1x), потом умножаем плечо
+        qty = max(0.0, (risk_cash / max(sig["atr"] * ATR_MULT_SL, 1e-8)) / sig["entry"]) * LEVERAGE
+        if qty <= 0:
+            return None
+
+        if sig["dir"] == "LONG":
+            sl = sig["entry"] - ATR_MULT_SL * sig["atr"]
+            tp = sig["entry"] * (1 + TP_PCT)
+        else:
+            sl = sig["entry"] + ATR_MULT_SL * sig["atr"]
+            tp = sig["entry"] * (1 - TP_PCT)
+
+        p["pos"] = {
+            "side": sig["dir"],
+            "entry": sig["entry"],
+            "qty": qty,
+            "sl": sl,
+            "tp": tp,
+            "atr": sig["atr"],
+            "slope": sig["slope"],
+            "label": sig["label"],
+            "opened": now_utc()
+        }
+        p["last_signal_ts"] = time.time()
+
+        msg = (
+            f"🔴 <b>OPEN {sym} {sig['dir']}</b>\n"
+            f"• time: {now_utc():%Y-%m-%d %H:%M:%S} UTC\n"
+            f"• entry: {fmt(sig['entry'], 5)}\n"
+            f"• qty: {fmt(qty, 6)}\n"
+            f"• TP: {fmt(tp,5)}   SL: {fmt(sl,5)}\n"
+            f"• signal: {sig['label']}, slope {fmt(sig['slope'],5)}, ATR {fmt(sig['atr'],5)}\n"
+            f"• mode: {'DEMO' if DEMO_MODE else 'LIVE'}"
+        )
+    send(msg)
+
+def close_position(sym: str, price: float, reason: str):
+    with state_lock:
+        p = state["pairs"][sym]
+        pos = p["pos"]
+        if not pos:
+            return
+        side = pos["side"]
+        entry = pos["entry"]
+        qty = pos["qty"]
+
+        if side == "LONG":
+            gross = (price - entry) * qty * LEVERAGE
+        else:
+            gross = (entry - price) * qty * LEVERAGE
+
+        fees = (entry + price) * qty * FEE_PCT
+        pnl = gross - fees
+
+        state["equity"] += pnl
+        p["pnl"] += pnl
+        p["trades"] += 1
+        if pnl > 0:
+            p["wins"] += 1
+        p["pos"] = None
+
+        msg = (
+            f"{'✅' if pnl>0 else '❌'} <b>CLOSE {sym} ({reason})</b>\n"
+            f"• time: {now_utc():%Y-%m-%d %H:%M:%S} UTC\n"
+            f"• exit: {fmt(price,5)}\n"
+            f"• PnL: {fmt(pnl,5)}\n"
+            f"• pair stats: trades {p['trades']}, WR {fmt((p['wins']/max(p['trades'],1))*100,2)}%, PnL {fmt(p['pnl'],5)}\n"
+            f"• total: equity {fmt(state['equity'],2)}  ({fmt(((state['equity']/DEMO_START_BAL)-1)*100,2)}% с начала)"
+        )
+    send(msg)
+
+def check_manage(sym: str, last_price: float):
+    with state_lock:
+        pos = state["pairs"][sym]["pos"]
+    if not pos:
+        return
+    if pos["side"] == "LONG":
+        if last_price >= pos["tp"]:
+            close_position(sym, pos["tp"], "TP")
+        elif last_price <= pos["sl"]:
+            close_position(sym, pos["sl"], "SL")
+    else:
+        if last_price <= pos["tp"]:
+            close_position(sym, pos["tp"], "TP")
+        elif last_price >= pos["sl"]:
+            close_position(sym, pos["sl"], "SL")
+
+def loop_symbol(sym: str):
     try:
-        payload = {"balance": balance, "positions": positions, "stats": stats}
-        with open(STATE_FILE, "w") as f:
-            json.dump(payload, f)
+        o,h,l,c = fetch_klines(sym, limit=max(EMA_LEN+ATR_LEN+30, 120))
     except Exception as e:
-        log.warning(f"Failed to save state: {e}")
+        log.warning(f"{sym} klines error: {e}")
+        return
 
-# --------------------------- health HTTP (koyeb) ----------------------
-class Quiet(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, *args, **kwargs): pass
+    if len(c) < 10:
+        return
 
-def serve_health():
-    PORT = 8080
+    last = c[-1]
+    # сопровождение
+    check_manage(sym, last)
+
+    # входы
+    with state_lock:
+        last_sig_ts = state["pairs"][sym]["last_signal_ts"]
+        in_pos = state["pairs"][sym]["pos"] is not None
+
+    if in_pos or (time.time() - last_sig_ts) < COOLDOWN_SEC:
+        return
+
+    sig = compute_signal(o,h,l,c)
+    if not sig:
+        return
+    open_position(sym, sig)
+
+# ------------- TELEGRAM HANDLERS -------------
+def cmd_start(update, context: CallbackContext):
+    update.message.reply_text("Привет! Команда: /status — покажу состояние.")
+
+def cmd_status(update, context: CallbackContext):
+    with state_lock:
+        lines = [f"📊 STATUS {now_utc():%Y-%m-%d %H:%M:%S} UTC"]
+        total_trades = 0
+        total_wr_num = 0
+        total_pnl = 0.0
+        for sym in PAIRS:
+            ps = state["pairs"][sym]
+            pos_line = "—"
+            if ps["pos"]:
+                pp = ps["pos"]
+                pos_line = f"{fmt(pp['qty'],6)} pos: {pp['side']} @ {fmt(pp['entry'],5)} (TP {fmt(pp['tp'],5)} / SL {fmt(pp['sl'],5)})"
+            lines.append(
+                f"{sym} • trades: {ps['trades']}  WR: {fmt((ps['wins']/max(ps['trades'],1))*100,2)}%  PnL: {fmt(ps['pnl'],5)}\n{pos_line}"
+            )
+            total_trades += ps["trades"]
+            total_wr_num += ps["wins"]
+            total_pnl += ps["pnl"]
+        lines.append("—")
+        wr_total = (total_wr_num / max(total_trades,1)) * 100
+        lines.append(
+            f"TOTAL • trades: {total_trades}  WR: {fmt(wr_total,2)}%  PnL: {fmt(total_pnl,5)}\n"
+            f"equity: {fmt(state['equity'],2)}  ({fmt(((state['equity']/DEMO_START_BAL)-1)*100,2)}% с начала)\n"
+            f"leverage: {fmt(LEVERAGE,1)}x  fee: {fmt(FEE_PCT*100,3)}%"
+        )
+    update.message.reply_text("\n".join(lines))
+
+def unknown(update, context):
+    update.message.reply_text("Команда не распознана. Доступно: /status")
+
+def on_error(update, context: CallbackContext):
+    err = context.error
+    if isinstance(err, Conflict):
+        log.critical("Conflict 409: другой процесс читает getUpdates. Останавливаю polling.")
+        try:
+            context.bot.stop()
+        except Exception:
+            pass
+        return
+    log.error("Telegram error", exc_info=err)
+
+# ------------- HEALTH (для polling) -------------
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+
+def start_health_server():
     try:
-        with socketserver.TCPServer(("0.0.0.0", PORT), Quiet) as httpd:
-            httpd.serve_forever()
+        httpd = HTTPServer(("0.0.0.0", 8080), Health)
+        log.info("Health server on :8080")
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
     except OSError as e:
         log.warning(f"Health server bind skipped: {e}")
 
-threading.Thread(target=serve_health, daemon=True).start()
+# ------------- BOOT -------------
+def start_scheduler():
+    sch = BackgroundScheduler(timezone="UTC")
+    for sym in PAIRS:
+        sch.add_job(
+            func=lambda s=sym: loop_symbol(s),
+            trigger=IntervalTrigger(seconds=TICK_SEC),
+            id=f"loop-{sym}",
+            replace_existing=True
+        )
+        log.info(f"Loop started for {sym}")
+    sch.start()
+    return sch
 
-# --------------------------- market data ------------------------------
-session = requests.Session()
-session.headers.update({"User-Agent": "mybot9/1.0"})
+def start_bot():
+    global bot
+    if not TELEGRAM_TOKEN:
+        log.critical("TELEGRAM_TOKEN не задан")
+        raise SystemExit(1)
 
-INTERVAL_MAP = {
-    "1m":"Min1", "3m":"Min3", "5m":"Min5", "15m":"Min15", "30m":"Min30",
-    "1h":"Hour1", "4h":"Hour4", "1d":"Day1"
-}
-def kline_interval(tf: str) -> str:
-    return INTERVAL_MAP.get(tf, "Min5")
+    # увеличиваем пул, чтобы не было "Connection pool is full"
+    updater = Updater(
+        token=TELEGRAM_TOKEN,
+        use_context=True,
+        request_kwargs={"con_pool_size": 8, "read_timeout": 30, "connect_timeout": 30},
+    )
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("status", cmd_status))
+    dp.add_handler(MessageHandler(Filters.command, unknown))
+    dp.add_error_handler(on_error)
 
-def fetch_klines(pair: str, limit=EMA_LEN+ATR_LEN+SLOPE_N+5) -> List[Tuple[float,float,float,float]]:
-    """
-    returns list of tuples (ts, open, high, low, close)
-    """
-    url = f"{MEXC_URL}/api/v1/contract/kline/{pair}"
-    params = {"interval": kline_interval(TF), "limit": limit}
-    r = session.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    kl = []
-    for it in data.get("data", []):
-        ts = int(it["t"]) / 1000
-        o,h,l,c = map(float, (it["o"], it["h"], it["l"], it["c"]))
-        kl.append((ts,o,h,l,c))
-    if not kl:
-        raise RuntimeError(f"no klines for {pair}")
-    return kl
+    global bot
+    bot = updater.bot
 
-# --------------------------- indicators --------------------------------
-def ema(values: List[float], length: int) -> float:
-    k = 2/(length+1)
-    e = values[0]
-    for v in values[1:]:
-        e = v*k + e*(1-k)
-    return e
+    # режим запуска
+    if USE_WEBHOOK:
+        if not PUBLIC_URL:
+            log.critical("Для webhook нужен PUBLIC_URL")
+            raise SystemExit(1)
+        wh_url = f"{PUBLIC_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
+        log.info(f"Setting webhook to {wh_url}")
+        updater.start_webhook(
+            listen="0.0.0.0", port=PORT, url_path=f"webhook/{WEBHOOK_SECRET}",
+            webhook_url=wh_url,
+            drop_pending_updates=True,
+        )
+    else:
+        # вырубаем вебхук и чистим хвосты апдейтов, чтобы не было 409
+        try:
+            updater.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            log.warning(f"delete_webhook: {e}")
+        updater.start_polling(drop_pending_updates=True)
+        if HEALTH_SERVER:
+            start_health_server()
 
-def atr(ohlc: List[Tuple[float,float,float,float,float]], length: int) -> float:
-    trs = []
-    prev_close = ohlc[0][4]
-    for (_,o,h,l,c) in ohlc[1:]:
-        tr = max(h-l, abs(h-prev_close), abs(l-prev_close))
-        trs.append(tr)
-        prev_close = c
-    if len(trs) < length: length = len(trs)
-    return sum(trs[-length:])/length if length>0 else 0.0
+    # приветствие
+    mode = "DEMO" if DEMO_MODE else "LIVE"
+    pairs_line = ", ".join(PAIRS)
+    msg = (
+        f"🤖 <b>mybot9 started ({state['version']})</b>\n"
+        f"Mode: {mode} | Risk {fmt(RISK_PCT*100,1)}% | TF {TIMEFRAME} | Tick {TICK_SEC}s\n"
+        f"Pairs: {pairs_line} | Balance: {int(DEMO_START_BAL)} USDT"
+    )
+    send(msg)
 
-def ema_slope(closes: List[float], length:int, bars:int) -> float:
-    if len(closes) < length+bars: return 0.0
-    e2 = ema(closes[-length:], length)
-    e1 = ema(closes[-length-bars:-bars], length)
-    return (e2 - e1) / max(1e-9, e1)
-
-def detect_signal(ohlc) -> Tuple[str, str]:
-    """
-    простая логика: молот/перевёрнутый молот + направление EMA-наклона
-    возвращает (side, reason) — side in {"LONG","SHORT",None}
-    """
-    *_, (t,o,h,l,c) = ohlc
-    body = abs(c - o)
-    upper = h - max(o,c)
-    lower = min(o,c) - l
-    is_hammer = lower > body*2 and upper < body
-    is_shoot  = upper > body*2 and lower < body
-
-    closes = [x[4] for x in ohlc]
-    slope = ema_slope(closes, EMA_LEN, SLOPE_N)
-
-    if is_hammer and slope >= 0:
-        return "LONG", f"hammer, slope {slope:.5f}"
-    if is_shoot and slope <= 0:
-        return "SHORT", f"hammer, slope {slope:.5f}"  # «hammer» для коротких — перевёрнутый
-    return None, f"slope {slope:.5f}"
-
-# --------------------------- trading engine ----------------------------
-last_trade_time: Dict[str, float] = {p: 0.0 for p in PAIRS}
-
-def position_size(balance_usdt: float, price: float) -> float:
-    risk_capital = balance_usdt * RISK
-    notional = risk_capital * LEV
-    qty = max(1e-8, notional / price)
-    return qty
-
-def open_position(pair: str, side: str, price: float, atr_val: float, reason: str):
-    global balance
-    if positions.get(pair):
-        return
-
-    # cooldown
-    if time.time() - last_trade_time.get(pair, 0) < COOLDOWN:
-        return
-    last_trade_time[pair] = time.time()
-
-    qty = position_size(balance, price)
-    tp = price * (1 + TP_P) if side == "LONG" else price * (1 - TP_P)
-    sl_off = ATR_K * atr_val
-    sl = price - sl_off if side == "LONG" else price + sl_off
-
-    positions[pair] = {
-        "side": side, "entry": price, "qty": qty,
-        "tp": tp, "sl": sl, "opened_at": now_utc().isoformat(),
-        "reason": reason
-    }
-    save_state()
-    send_open(pair, side, price, qty, tp, sl, reason)
-
-def check_positions(pair: str, last_price: float):
-    global balance, stats
-    pos = positions.get(pair)
-    if not pos: return
-    side = pos["side"]
-    entry, qty, tp, sl = pos["entry"], pos["qty"], pos["tp"], pos["sl"]
-
-    hit_tp = last_price >= tp if side == "LONG" else last_price <= tp
-    hit_sl = last_price <= sl if side == "LONG" else last_price >= sl
-    if not (hit_tp or hit_sl):
-        return
-
-    # close
-    exit_price = tp if hit_tp else sl
-    pnl_notional = (exit_price - entry) * qty * (1 if side=="LONG" else -1)
-    fee_cost = (entry + exit_price) * qty * FEE
-    pnl = pnl_notional - fee_cost
-    balance += pnl
-
-    # stats
-    s = stats["pairs"][pair]
-    s["trades"] += 1
-    s["pnl"] += pnl
-    if pnl > 0: s["wins"] += 1
-    stats["total"]["trades"] += 1
-    stats["total"]["pnl"] += pnl
-    if pnl > 0: stats["total"]["wins"] += 1
-
-    # message
-    send_close(pair, exit_price, pnl, hit_tp)
-
-    # remove
-    del positions[pair]
-    save_state()
-
-# --------------------------- telegram ---------------------------------
-bot = Bot(token=TELEGRAM_TOKEN)
-updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-dp = updater.dispatcher
-
-def human_pair_stat(pair: str) -> str:
-    s = stats["pairs"][pair]
-    wr = (s["wins"]/s["trades"]*100) if s["trades"] else 0.0
-    pnl = s["pnl"]
-    pos = positions.get(pair)
-    pos_line = "—"
-    if pos:
-        pos_line = f"{pos['qty']:.6f}  pos: <b>{pos['side']}</b> @ {pos['entry']:.5f} (TP {pos['tp']:.5f} / SL {pos['sl']:.5f})"
-    return (f"{pair} • trades: {s['trades']}  WR: {wr:.2f}%  PnL: {pnl:.5f}\n"
-            f"{pos_line}")
-
-def cmd_start(update, ctx):
-    msg = (f"🤖 mybot9 started (v13)\n"
-           f"Mode: {MODE} | Risk {RISK*100:.1f}% | TF {TF} | Tick {COOLDOWN}s\n"
-           f"Pairs: {', '.join(PAIRS)} | Balance: {balance:.2f} USDT")
-    ctx.bot.send_message(CHAT_ID, msg)
-
-def cmd_status(update, ctx):
-    lines = [f"📊 STATUS {now_utc():%Y-%m-%d %H:%M:%S} UTC"]
-    for p in PAIRS:
-        lines.append(human_pair_stat(p))
-        lines.append("—")
-    tot = stats["total"]
-    wr = (tot["wins"]/tot["trades"]*100) if tot["trades"] else 0.0
-    lines.append(f"TOTAL • trades: {tot['trades']}  WR: {wr:.2f}%  PnL: {tot['pnl']:.5f}")
-    lines.append(f"equity: {balance:.2f}")
-    lines.append(f"leverage: {LEV:.1f}x  fee: {FEE*100:.3f}%")
-    ctx.bot.send_message(CHAT_ID, "\n".join(lines), parse_mode=ParseMode.HTML)
-
-dp.add_handler(CommandHandler("start", cmd_start))
-dp.add_handler(CommandHandler("status", cmd_status))
-
-def send_open(pair, side, entry, qty, tp, sl, reason):
-    text = (f"🔴 OPEN {pair} {side}\n"
-            f"• time: {now_utc():%Y-%m-%d %H:%M:%S} UTC\n"
-            f"• entry: {entry:.5f}\n"
-            f"• qty: {qty:.6f}\n"
-            f"• TP: {tp:.5f}   SL: {sl:.5f}\n"
-            f"• signal: {reason}\n"
-            f"• mode: {MODE}")
-    bot.send_message(chat_id=CHAT_ID, text=text)
-
-def send_close(pair, exit_price, pnl, is_tp):
-    s = stats["pairs"][pair]
-    tot = stats["total"]
-    text = (f"{'✅' if is_tp else '❌'} CLOSE {pair} ({'TP' if is_tp else 'SL'})\n"
-            f"• time: {now_utc():%Y-%m-%d %H:%M:%S} UTC\n"
-            f"• exit: {exit_price:.5f}\n"
-            f"• PnL: {pnl:+.5f}\n"
-            f"• pair stats: trades {s['trades']}, WR {(s['wins']/s['trades']*100 if s['trades'] else 0):.2f}%, PnL {s['pnl']:+.5f}\n"
-            f"• total: trades {tot['trades']}, WR {(tot['wins']/tot['trades']*100 if tot['trades'] else 0):.2f}%, PnL {tot['pnl']:+.5f}\n"
-            f"• balance: {balance:.5f}")
-    bot.send_message(chat_id=CHAT_ID, text=text)
-
-# --------------------------- main loop --------------------------------
-def loop_pair(pair: str):
-    try:
-        ohlc = fetch_klines(pair)
-        atr_v = atr(ohlc[-(ATR_LEN+1):], ATR_LEN)
-        side, reason = detect_signal(ohlc)
-        last_close = ohlc[-1][4]
-
-        # manage open
-        check_positions(pair, last_close)
-
-        # open if no position
-        if side and pair not in positions:
-            open_position(pair, side, last_close, atr_v, reason)
-
-    except Exception as e:
-        log.warning(f"{pair} loop error: {e}")
-
-# --------------------------- scheduler --------------------------------
-from apscheduler.schedulers.background import BackgroundScheduler
+    return updater
 
 def main():
-    load_state()
-    log.info(f"Mode {MODE} demo={DEMO} dry={DRY_RUN}  pairs={PAIRS} tf={TF}  "
-             f"risk={RISK*100:.1f}% tp={TP_P*100:.3f}% atr_len={ATR_LEN} atr_mult={ATR_K} ema={EMA_LEN}/{SLOPE_N}")
-
-    # старт polling (без вебхука, чтобы не ловить конфликт портов)
-    updater.start_polling(clean=True)
-
-    # работающий jobs
-    sched = BackgroundScheduler(timezone=TZ)
-    for p in PAIRS:
-        # интервал чуть чаще TF, но сдвинут чтобы не ловить сырую свечу
-        sched.add_job(lambda pair=p: loop_pair(pair), "interval", seconds=COOLDOWN, id=f"loop-{p}")
-        bot.send_message(CHAT_ID, f"✅ Loop started for <b>{p}</b>", parse_mode=ParseMode.HTML)
-    sched.start()
-    log.info("Scheduler started")
-
+    # старт
+    scheduler = start_scheduler()
+    updater = start_bot()
+    # держим процесс
     updater.idle()
-    # при стопе сохраним
-    save_state()
+    scheduler.shutdown(wait=False)
 
 if __name__ == "__main__":
     main()
