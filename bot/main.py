@@ -19,7 +19,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 from telegram.utils.request import Request
 
 # ---------------------------------------
-# ЛОГГЕР
+# ЛОГГИРОВАНИЕ
 # ---------------------------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -29,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------
-# ЧТЕНИЕ ENV
+# ENV
 # ---------------------------------------
 ENV = os.getenv
 
@@ -42,7 +42,6 @@ WEBHOOK_SECRET = ENV("WEBHOOK_SECRET", "hook").strip()
 
 PORT = int(ENV("PORT", "8080"))
 
-# Трейдинг-параметры (используются и в статусе)
 PAIRS = [s.strip() for s in ENV("PAIRS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
 TIMEFRAME = ENV("TIMEFRAME", "5m").strip()
 RISK_PCT = float(ENV("RISK_PCT", "1"))
@@ -58,7 +57,7 @@ DEMO_MODE = ENV("DEMO_MODE", "true").lower() == "true"
 DRY_RUN = ENV("DRY_RUN", "false").lower() == "true"
 DAILY_SUMMARY = ENV("DAILY_SUMMARY", "1") == "1"
 
-TX_NAME = ENV("TX", "UTC")  # таймзона из ENV
+TX_NAME = ENV("TX", "UTC")
 try:
     TZ = pytz.timezone(TX_NAME)
 except Exception:
@@ -66,13 +65,10 @@ except Exception:
     TZ = pytz.UTC
 
 # ---------------------------------------
-# ГЛОБАЛЬНОЕ СОСТОЯНИЕ (простая имитация)
+# ГЛОБАЛЬНОЕ СОСТОЯНИЕ (упрощённо)
 # ---------------------------------------
 state = {
-    "started": False,
-    "balances": {
-        "demo": float(ENV("DEMO_START_BALANCE", "5000"))
-    },
+    "balances": {"demo": float(ENV("DEMO_START_BALANCE", "5000"))},
     "pnl": 0.0,
     "wins": 0,
     "losses": 0,
@@ -81,27 +77,15 @@ state = {
     "pair_stats": {p: {"trades": 0, "wins": 0, "losses": 0} for p in PAIRS},
 }
 
-# ---------------------------------------
-# ТЕЛЕГРАМ: бот/апдейтер
-# ---------------------------------------
-def build_updater() -> Updater:
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN не задан")
-
-    # увеличим пул, чтобы не было 'Connection pool is full'
-    req = Request(con_pool_size=8, connect_timeout=30, read_timeout=30)
-    updater = Updater(token=TELEGRAM_TOKEN, request=req, use_context=True)
-    return updater
-
 bot: Bot = None
 updater: Updater = None
 scheduler: BackgroundScheduler = None
 
 # ---------------------------------------
-# ХЕЛС-СЕРВЕР (ТОЛЬКО ДЛЯ POLLING)
+# HEALTH-СЕРВЕР (ТОЛЬКО для POLLING)
 # ---------------------------------------
 class Quiet(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
+    def log_message(self, format, *args):  # тише в логах
         return
     def do_GET(self):
         if self.path.startswith("/health"):
@@ -123,23 +107,16 @@ def start_health_server():
                 httpd.serve_forever()
         except OSError as e:
             logger.warning("Health server bind skipped: %s", e)
-
     t = threading.Thread(target=_serve, name="health", daemon=True)
     t.start()
 
 # ---------------------------------------
-# ТВОЙ ЛУП ПО ПАРАМ (сюда вшита заглушка)
+# ОСНОВНОЙ ЛУП ПО ПАРЕ (заглушка)
 # ---------------------------------------
 def loop_pair(pair: str):
-    """
-    Здесь должна быть твоя логика: запрос свечей, сигналы, выставление сделок (или DEMO),
-    апдейт state + отправка уведомлений при закрытии сделок и т.д.
-    Сейчас — безопасная заглушка, чтоб сервис стабильно крутился.
-    """
     try:
         logger.info("Tick %s @ %s", pair, datetime.now(timezone.utc).strftime("%H:%M:%S"))
-        # Пример "имитации": раз в несколько тиков считаем, что закрыли +TP
-        # НИЧЕГО НЕ ДЕЛАЕМ С СЕТКОЙ/БИРЖЕЙ — это безопасно.
+        # TODO: здесь реальная торговая логика (сигналы/TP/SL/DEMO-LIVE)
     except Exception as e:
         logger.exception("Loop error %s: %s", pair, e)
 
@@ -152,8 +129,6 @@ def start_scheduler():
         return scheduler
 
     scheduler = BackgroundScheduler(timezone=TZ)
-
-    # запуск по парам каждые COOLDOWN_SEC
     for p in PAIRS:
         scheduler.add_job(
             loop_pair,
@@ -162,10 +137,23 @@ def start_scheduler():
             id=f"loop-{p}",
             replace_existing=True,
         )
-
     scheduler.start()
     logger.info("Scheduler started")
     return scheduler
+
+# ---------------------------------------
+# TELEGRAM
+# ---------------------------------------
+def build_updater() -> Updater:
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан")
+
+    # В PTB 13.15 нельзя передавать request=... в Updater.
+    # Нужно создать Request -> Bot(..., request=req) -> Updater(bot=bot)
+    req = Request(con_pool_size=8, connect_timeout=30, read_timeout=30)
+    tg_bot = Bot(token=TELEGRAM_TOKEN, request=req)
+    _updater = Updater(bot=tg_bot, use_context=True)
+    return _updater
 
 # ---------------------------------------
 # HANDLERS
@@ -229,9 +217,6 @@ def cmd_config(update, context):
 def unknown(update, context):
     update.message.reply_text("Не знаю такую команду. Есть /status и /config.")
 
-# ---------------------------------------
-# ИНИЦИАЛИЗАЦИЯ ТГ + РОУТИНГ
-# ---------------------------------------
 def init_handlers(_updater: Updater):
     dp = _updater.dispatcher
     dp.add_handler(CommandHandler("start", cmd_start))
@@ -248,7 +233,7 @@ def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN обязателен")
 
-    # Сразу поднимем планировщик
+    # Планировщик один раз
     start_scheduler()
 
     # Telegram
@@ -257,19 +242,18 @@ def main():
     init_handlers(updater)
 
     if USE_WEBHOOK:
-        # Только WEBHOOK, НИКАКОГО POLLING И НИКАКОГО ДОП.СЕРВЕРА
         if not PUBLIC_URL:
             raise RuntimeError("PUBLIC_URL обязателен при USE_WEBHOOK=1")
+
         path = f"webhook/{WEBHOOK_SECRET}"
         webhook_url = f"{PUBLIC_URL.rstrip('/')}/{path}"
         logger.info("Webhook mode on port %s", PORT)
         logger.info("Setting webhook to %s", webhook_url)
 
-        # Сбрасываем старые обновления и ставим webhook
+        # сбросить возможный старый webhook и поставить новый
         bot.delete_webhook()
         bot.set_webhook(webhook_url)
 
-        # PTB 13.15
         updater.start_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -278,13 +262,10 @@ def main():
         )
         logger.info("Webhook server started")
         updater.idle()
-
     else:
-        # Только POLLING: поднимем лёгкий HTTP для health (на PORT)
+        # Polling + health endpoint (для Koyeb)
         start_health_server()
-
         logger.info("Starting polling…")
-        # PTB 13.15
         updater.start_polling(drop_pending_updates=True)
         updater.idle()
 
