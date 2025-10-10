@@ -1,9 +1,4 @@
-# телеграм и стек совместимых зависимостей
 python-telegram-bot==13.15
-requests==2.32.3
-urllib3==1.26.18
-six==1.16.0
-
-# дата-стек
-pandas==2.2.2
-numpy==1.26.4
+APScheduler==3.10.4
+requests==2.31.0
+pytz==2024.1
